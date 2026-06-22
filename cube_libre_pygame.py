@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 #
+# ~~~~~~~~~~~~~~~~~~~~
+# cube_libre_pygame.py
+# ~~~~~~~~~~~~~~~~~~~~
+#
 # "Cube Libre" - rotating-field fixed prototype
 #
 # A cubistic puzzle/adventure game where the player is a cube made of smaller cubes.
@@ -12,7 +16,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.49-no-accidental-level1-reset"
+version_number = "0.15.50-first-run-asset-notice"
 
 import colorsys
 import json
@@ -113,6 +117,11 @@ LEVEL_READY_FADE_IN_SECONDS = 0.95
 AUDIO_ENABLED = True
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_DIR_NAME = "cube_libre_sfx"
+# On first run, the procedural audio WAVs may take a while to synthesize,
+# especially on Windows. Keep the title screen alive, show a clear setup
+# notice, and do not allow starting the run until the missing audio cache has
+# either loaded successfully or failed gracefully.
+AUDIO_BLOCK_START_WHILE_GENERATING = True
 SAVE_FILE_NAME = "cube_libre_scores.json"
 PORTAL_LOCAL_X = 20.0
 # The portal is drawn as a square plane, so the gameplay capture area should
@@ -1042,7 +1051,12 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
     prompt = pygame.Surface((760, 70), pygame.SRCALPHA)
     big = get_font(32, True)
     tr, tg, tb = [int(v * 255) for v in _hsv(t * 0.10, 0.55, 1.0)]
-    label = "SPACE / ENTER = NEW RUN"
+    if audio_start_blocked():
+        label = "RENDERING AUDIO ASSETS - PLEASE WAIT"
+    elif audio_setup_failed():
+        label = "AUDIO DISABLED - SPACE / ENTER = NEW RUN"
+    else:
+        label = "SPACE / ENTER = NEW RUN"
     # Soft cheap glow by drawing the same text a few times with low alpha.
     for ox, oy, alpha in [(-3, 0, 60), (3, 0, 60), (0, -3, 60), (0, 3, 60), (0, 0, 95)]:
         glow = big.render(label, True, (tr, tg, tb))
@@ -1084,6 +1098,61 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
     footer_panel.blit(shadow, (x + 1, 5))
     footer_panel.blit(footer, (x, 4))
     draw_surface_2d(footer_panel, DISPLAY[0] // 2, DISPLAY[1] - 16)
+
+def render_audio_setup_overlay(t: float):
+    """First-run procedural-audio cache notice for slow systems.
+
+    The title window can appear before the long WAV synthesis worker is done.
+    Without an explicit overlay, Windows users see a responsive-looking window
+    that refuses to start and it looks like the game froze.
+    """
+    if not bool(_audio.get("assets_missing_on_start")):
+        return
+    if not (audio_setup_in_progress() or audio_setup_failed()):
+        return
+
+    ready, total = audio_asset_cache_progress()
+    pulse = 0.55 + 0.45 * math.sin(t * 5.2)
+    panel = pygame.Surface((760, 178), pygame.SRCALPHA)
+    pygame.draw.rect(panel, (0, 0, 0, 212), panel.get_rect(), border_radius=18)
+
+    if audio_setup_failed():
+        border = (255, 90, 45, 150 + int(70 * pulse))
+        title_text = "AUDIO SETUP FAILED"
+        body_1 = "Procedural audio could not be loaded."
+        body_2 = "The game can still run silently."
+        body_3 = "SPACE / ENTER = start anyway"
+    else:
+        border = (0, 235, 245, 138 + int(82 * pulse))
+        title_text = "FIRST RUN SETUP"
+        body_1 = "Audio assets not found. Rendering procedural sound cache..."
+        body_2 = f"{AUDIO_DIR_NAME}/ will be reused on later runs."
+        body_3 = "Please wait. Start is locked until setup is ready."
+
+    pygame.draw.rect(panel, border, panel.get_rect(), width=2, border_radius=18)
+
+    title = get_font(33, True)
+    body = get_font(18, False)
+    tiny = get_font(15, False)
+    title_s = title.render(title_text, True, (230, 255, 255) if not audio_setup_failed() else (255, 210, 190))
+    b1 = body.render(body_1, True, (215, 238, 242))
+    b2 = body.render(body_2, True, (185, 224, 230))
+    b3 = body.render(body_3, True, (255, 225, 140) if audio_setup_failed() else (180, 255, 235))
+
+    panel.blit(title_s, ((panel.get_width() - title_s.get_width()) // 2, 18))
+    panel.blit(b1, ((panel.get_width() - b1.get_width()) // 2, 62))
+    panel.blit(b2, ((panel.get_width() - b2.get_width()) // 2, 89))
+    panel.blit(b3, ((panel.get_width() - b3.get_width()) // 2, 116))
+
+    bar_x, bar_y, bar_w, bar_h = 90, 150, 580, 6
+    pygame.draw.rect(panel, (35, 55, 62, 210), (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+    fill_w = int(bar_w * (ready / max(1, total)))
+    pygame.draw.rect(panel, (0, 230, 245, 225), (bar_x, bar_y, fill_w, bar_h), border_radius=4)
+    progress = tiny.render(f"audio cache files: {ready}/{total}", True, (165, 205, 212))
+    panel.blit(progress, ((panel.get_width() - progress.get_width()) // 2, 158))
+
+    draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2 + 120)
+
 
 def render_quit_confirm(t: float):
     pulse = 0.55 + 0.45 * math.sin(t * 5.0)
@@ -1138,7 +1207,7 @@ def render_help_overlay(t: float, game_state: str, level: int):
         (body, "Esc                   title screen / quit confirm", (210, 235, 240), 376),
         (body, "Alt+F, F11, Alt+Enter fullscreen / windowed", (210, 235, 240), 400),
         (body, "M                     mute / unmute", (210, 235, 240), 424),
-        (body, "R                     reset run", (210, 235, 240), 448),
+        (body, "Ctrl+R                reset run", (210, 235, 240), 448),
     ]
     for font, text, color, y in rows:
         s = font.render(text, True, color)
@@ -3966,6 +4035,8 @@ _audio = {
     "asset_paths": {},
     "asset_error": None,
     "worker": None,
+    "assets_missing_on_start": False,
+    "asset_missing_names": [],
 }
 
 
@@ -3975,6 +4046,45 @@ def _audio_dir():
     except Exception:
         base = os.getcwd()
     return os.path.join(base, AUDIO_DIR_NAME)
+
+
+AUDIO_ASSET_FILENAMES = {
+    "crash": "crash_collision.wav",
+    "structure_alert": "structure_loss_dee_doo.wav",
+    "ambient": "spaceship_engine_room_hum_loop.wav",
+    "gamelan": "alien_gamelan_more_frequent_v3.wav",
+    "field": "field_wooom_loop.wav",
+    "critical": "critical_beep_loop.wav",
+    "portal": "portal_ethereal_entry.wav",
+    "portal_wou": "portal_wou_wou_slow_loop.wav",
+    "laser_reveal": "laser_grid_reveal_ominous_woosh.wav",
+    "laser_dissipate": "laser_grid_dissipate_exhale_aaah.wav",
+    "materialize": "course_materialize.wav",
+    "death": "cube_death_whiteout.wav",
+    "reassembly": "cube_reassembly.wav",
+    "recouple": "cube_recoupling_request.wav",
+    "collapse": "joint_cage_collapse_cashhh_octave_down.wav",
+    "time_tick": "time_tick_tock_loop.wav",
+    "time_buzzer": "time_buzzer_10sec_berrrrt.wav",
+    "time_siren": "time_siren_5sec_wiuwiu_loop.wav",
+}
+
+
+def expected_audio_asset_paths(out_dir: str = None):
+    if out_dir is None:
+        out_dir = _audio_dir()
+    return {name: os.path.join(out_dir, filename) for name, filename in AUDIO_ASSET_FILENAMES.items()}
+
+
+def audio_missing_asset_names():
+    return [name for name, path in expected_audio_asset_paths().items() if not os.path.exists(path)]
+
+
+def audio_asset_cache_progress():
+    paths = expected_audio_asset_paths()
+    total = len(paths)
+    ready = sum(1 for path in paths.values() if os.path.exists(path))
+    return ready, total
 
 
 def _pcm16(v: float) -> int:
@@ -4025,26 +4135,7 @@ def generate_audio_assets(force: bool = False):
     os.makedirs(out_dir, exist_ok=True)
     audio_rng = random.Random(24601)
 
-    paths = {
-        "crash": os.path.join(out_dir, "crash_collision.wav"),
-        "structure_alert": os.path.join(out_dir, "structure_loss_dee_doo.wav"),
-        "ambient": os.path.join(out_dir, "spaceship_engine_room_hum_loop.wav"),
-        "gamelan": os.path.join(out_dir, "alien_gamelan_more_frequent_v3.wav"),
-        "field": os.path.join(out_dir, "field_wooom_loop.wav"),
-        "critical": os.path.join(out_dir, "critical_beep_loop.wav"),
-        "portal": os.path.join(out_dir, "portal_ethereal_entry.wav"),
-        "portal_wou": os.path.join(out_dir, "portal_wou_wou_slow_loop.wav"),
-        "laser_reveal": os.path.join(out_dir, "laser_grid_reveal_ominous_woosh.wav"),
-        "laser_dissipate": os.path.join(out_dir, "laser_grid_dissipate_exhale_aaah.wav"),
-        "materialize": os.path.join(out_dir, "course_materialize.wav"),
-        "death": os.path.join(out_dir, "cube_death_whiteout.wav"),
-        "reassembly": os.path.join(out_dir, "cube_reassembly.wav"),
-        "recouple": os.path.join(out_dir, "cube_recoupling_request.wav"),
-        "collapse": os.path.join(out_dir, "joint_cage_collapse_cashhh_octave_down.wav"),
-        "time_tick": os.path.join(out_dir, "time_tick_tock_loop.wav"),
-        "time_buzzer": os.path.join(out_dir, "time_buzzer_10sec_berrrrt.wav"),
-        "time_siren": os.path.join(out_dir, "time_siren_5sec_wiuwiu_loop.wav"),
-    }
+    paths = expected_audio_asset_paths(out_dir)
 
     def need(name):
         return force or not os.path.exists(paths[name])
@@ -4495,11 +4586,16 @@ def init_audio():
             pygame.mixer.init(frequency=AUDIO_SAMPLE_RATE, size=-16, channels=2, buffer=512)
         pygame.mixer.set_num_channels(16)
         _reserve_audio_channels()
+        missing_names = audio_missing_asset_names()
         _audio["init_started"] = True
         _audio["load_attempted"] = False
         _audio["assets_ready"] = False
         _audio["asset_paths"] = {}
         _audio["asset_error"] = None
+        _audio["assets_missing_on_start"] = bool(missing_names)
+        _audio["asset_missing_names"] = missing_names
+        if missing_names:
+            print(f"[INFO] Audio assets not found/generated yet ({len(missing_names)} missing). Rendering procedural audio into: {_audio_dir()}")
         worker = threading.Thread(target=_audio_asset_worker, kwargs={"force": False}, daemon=True)
         _audio["worker"] = worker
         worker.start()
@@ -4507,6 +4603,8 @@ def init_audio():
     except Exception as exc:
         _audio["ok"] = False
         _audio["init_started"] = False
+        _audio["assets_missing_on_start"] = False
+        _audio["asset_missing_names"] = []
         print(f"[WARN] Audio disabled: {exc}")
 
 
@@ -4535,6 +4633,27 @@ def audio_try_finish_init():
     except Exception as exc:
         _audio["ok"] = False
         print(f"[WARN] Audio disabled: {exc}")
+
+def audio_setup_in_progress() -> bool:
+    return (
+        bool(_audio.get("init_started"))
+        and not bool(_audio.get("ok"))
+        and not bool(_audio.get("load_attempted"))
+        and not bool(_audio.get("asset_error"))
+    )
+
+
+def audio_start_blocked() -> bool:
+    return (
+        bool(AUDIO_BLOCK_START_WHILE_GENERATING)
+        and bool(_audio.get("assets_missing_on_start"))
+        and audio_setup_in_progress()
+    )
+
+
+def audio_setup_failed() -> bool:
+    return bool(_audio.get("assets_missing_on_start")) and bool(_audio.get("load_attempted")) and not bool(_audio.get("ok"))
+
 
 def audio_available() -> bool:
     return bool(_audio.get("ok")) and not bool(_audio.get("muted"))
@@ -5758,6 +5877,9 @@ def main():
         # Native Windows maximize/restore can resize the OpenGL client area without
         # a useful VIDEORESIZE event. Keep viewport/projection synchronized anyway.
         apply_gl_viewport_for_display()
+        # Poll the background procedural-audio worker before accepting title input,
+        # so first-run setup can unlock the start prompt as soon as assets load.
+        audio_try_finish_init()
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -5819,14 +5941,20 @@ def main():
                         game_state = "title"
                         set_message("QUIT CANCELLED", 0.8)
                     elif event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER):
-                        start_new_run("NEW RUN")
+                        if audio_start_blocked():
+                            set_message("AUDIO ASSETS GENERATING", 0.95)
+                        else:
+                            start_new_run("NEW RUN")
 
                 elif event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER):
                     # No mid-level SPACE restart. On the result overlay, advance
                     # the cleared run to the next level instead of accidentally
                     # starting level 1 again.
                     if game_state == "title":
-                        start_new_run("NEW RUN")
+                        if audio_start_blocked():
+                            set_message("AUDIO ASSETS GENERATING", 0.95)
+                        else:
+                            start_new_run("NEW RUN")
                     elif game_state == "result_overlay":
                         advance_after_transcendence()
                     else:
@@ -6080,6 +6208,7 @@ def main():
         # Draw world first, then overlays/HUD. Title/quit confirm are not-playing scenes.
         if game_state in ("title", "quit_confirm"):
             draw_title_screen(t, score, best_escape, highest_level)
+            render_audio_setup_overlay(t)
             if game_state == "quit_confirm":
                 render_quit_confirm(t)
         elif game_state == "level_ready":
@@ -6156,6 +6285,9 @@ def main():
         caption_timer -= dt
         if caption_timer <= 0.0:
             msg = f" | {message_text}" if message_timer > 0.0 else ""
+            if audio_start_blocked():
+                ready, total = audio_asset_cache_progress()
+                msg = f" | audio assets {ready}/{total} generating"
             pygame.display.set_caption(
                 f"Cube Libre v.{version_number} | state: {game_state} | level: {current_level} | intact: {player.intact_count():3d}/{MAX_CELLS} | "
                 f"score: {score} | best: {best_escape}/{MAX_CELLS} | highest level: {highest_level} | "

@@ -52,6 +52,13 @@ PyOpenGL
 numpy
 ```
 
+### First run note
+
+On the first run, Cube Libre generates procedural audio assets into `cube_libre_sfx/`.
+This can take a while on some systems, especially on Windows. Later runs reuse the generated files and should start faster.
+
+To force regeneration, delete `cube_libre_sfx/`.
+
 ## Running
 
 From the repository root:
