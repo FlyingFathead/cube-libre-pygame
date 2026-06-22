@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.65-first-run-setup-lower"
+version_number = "0.15.66-debug-console"
 
 import colorsys
 import importlib.util
@@ -134,6 +134,26 @@ PREVIEW_MODULES_AHEAD = 1
 # run, require Ctrl+R for the destructive full-run reset. Title/result screens
 # can still start/reset normally.
 RUN_RESET_REQUIRES_CTRL_DURING_PLAY = True
+
+# In-game developer/debug console. Enabled by default for prototype iteration.
+# Primary key is the classic console/backquote key; Ctrl+Shift+F1 is kept as a
+# fallback for keyboard layouts where backquote is awkward. Ctrl+Alt+Fx is
+# intentionally avoided because Linux desktops/TTY switching can eat that combo.
+DEBUG_CONSOLE_ENABLED = True
+DEBUG_CONSOLE_PAUSES_GAME = True
+DEBUG_CONSOLE_MAX_LOG_LINES = 120
+DEBUG_CONSOLE_VISIBLE_LOG_LINES = 13
+DEBUG_CONSOLE_PRIMARY_BACKQUOTE = True
+DEBUG_CONSOLE_FALLBACK_CTRL_SHIFT_F1 = True
+DEBUG_FLAGS = {
+    "damage": True,
+    "lasers": True,
+    "bounds": True,
+    "noclip": False,
+    "portal": True,
+    "suction": True,
+    "route3d": True,
+}
 
 CUBE_SIZE = 5                 # odd number; 5 -> local coords -2..2 on each axis
 CELL_SPACING = 1.0
@@ -1547,6 +1567,149 @@ def render_help_overlay(t: float, game_state: str, level: int):
     draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2)
 
 
+# -----------------------------------------------------------------------------
+# In-game debug console
+# -----------------------------------------------------------------------------
+
+def debug_flag_enabled(name: str, default: bool = True) -> bool:
+    return bool(DEBUG_FLAGS.get(str(name).lower(), default))
+
+
+def debug_bool_text(value) -> str:
+    return "ON" if bool(value) else "OFF"
+
+
+def debug_parse_bool_token(value):
+    token = str(value).strip().lower()
+    if token in ("1", "true", "on", "yes", "y", "enable", "enabled"):
+        return True
+    if token in ("0", "false", "off", "no", "n", "disable", "disabled"):
+        return False
+    raise ValueError("expected on/off, true/false, or 1/0")
+
+
+def is_debug_console_toggle_key(key, mods) -> bool:
+    if not DEBUG_CONSOLE_ENABLED:
+        return False
+    alt_down = bool(mods & pygame.KMOD_ALT)
+    ctrl_down = bool(mods & pygame.KMOD_CTRL)
+    shift_down = bool(mods & pygame.KMOD_SHIFT)
+    backquote_key = getattr(pygame, "K_BACKQUOTE", None)
+
+    if DEBUG_CONSOLE_PRIMARY_BACKQUOTE and backquote_key is not None and key == backquote_key:
+        return True
+    if DEBUG_CONSOLE_FALLBACK_CTRL_SHIFT_F1 and key == pygame.K_F1 and ctrl_down and shift_down and not alt_down:
+        return True
+    return False
+
+
+def _debug_wrap_line(line: str, font, max_width: int):
+    """Wrap console output to fit the panel without needing a full text widget."""
+    line = str(line)
+    if not line:
+        return [""]
+    chunks = []
+    current = ""
+    for ch in line:
+        test = current + ch
+        try:
+            too_wide = font.size(test)[0] > max_width
+        except Exception:
+            too_wide = len(test) > 96
+        if too_wide and current:
+            chunks.append(current)
+            current = ch
+        else:
+            current = test
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def render_debug_console(t: float, input_text: str, cursor_pos: int, log_lines, scroll: int,
+                         game_state: str, current_level: int, player: "PlayerCube",
+                         score: int, paused: bool):
+    """Draw the modal developer console over the current scene.
+
+    This is intentionally primitive and self-contained: no external GUI system,
+    just a dark terminal slab rendered through the existing 2D surface path.
+    """
+    overlay = pygame.Surface((DISPLAY[0], DISPLAY[1]), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 118))
+    draw_surface_2d(overlay, DISPLAY[0] // 2, DISPLAY[1] // 2)
+
+    panel_w = min(DISPLAY[0] - 54, 980)
+    panel_h = min(DISPLAY[1] - 72, 420)
+    panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    pulse = 0.55 + 0.45 * math.sin(t * 4.2)
+    pygame.draw.rect(panel, (6, 8, 10, 232), panel.get_rect(), border_radius=14)
+    pygame.draw.rect(panel, (0, 235, 245, 130 + int(72 * pulse)), panel.get_rect(), width=2, border_radius=14)
+
+    title_font = get_font(18, True)
+    font = get_font(15, False)
+    tiny = get_font(13, False)
+
+    intact = player.intact_count() if player is not None else 0
+    flag_bits = " ".join(
+        f"{name}:{debug_bool_text(DEBUG_FLAGS.get(name, False))}"
+        for name in ("damage", "lasers", "bounds", "noclip", "portal", "suction", "route3d")
+    )
+    header = f"CUBE LIBRE DEBUG CONSOLE  ·  state={game_state}  level={current_level}  cubes={intact}/{MAX_CELLS}  score={score}"
+    header_s = title_font.render(header, True, (220, 255, 255))
+    panel.blit(header_s, (18, 14))
+
+    flag_s = tiny.render(flag_bits, True, (148, 214, 220))
+    panel.blit(flag_s, (18, 38))
+
+    log_x = 18
+    log_y = 64
+    log_w = panel_w - 36
+    line_h = 18
+    prompt_h = 44
+    max_log_lines = max(3, min(DEBUG_CONSOLE_VISIBLE_LOG_LINES, (panel_h - log_y - prompt_h) // line_h))
+
+    wrapped = []
+    for line in log_lines:
+        wrapped.extend(_debug_wrap_line(line, font, log_w))
+    scroll = max(0, int(scroll))
+    end = max(0, len(wrapped) - scroll)
+    start = max(0, end - max_log_lines)
+    visible = wrapped[start:end]
+
+    y = log_y
+    for line in visible:
+        color = (210, 232, 235)
+        if line.startswith(">"):
+            color = (180, 255, 190)
+        elif line.startswith("[ERR]") or line.startswith("ERR"):
+            color = (255, 155, 125)
+        elif line.startswith("[OK]") or line.startswith("OK"):
+            color = (160, 255, 190)
+        elif line.startswith("[INFO]"):
+            color = (165, 220, 255)
+        surf = font.render(line, True, color)
+        panel.blit(surf, (log_x, y))
+        y += line_h
+
+    if scroll > 0:
+        scroll_s = tiny.render(f"scroll +{scroll} lines", True, (255, 225, 130))
+        panel.blit(scroll_s, (panel_w - scroll_s.get_width() - 18, 42))
+
+    pygame.draw.line(panel, (0, 190, 200, 120), (18, panel_h - 48), (panel_w - 18, panel_h - 48), 1)
+
+    cursor_pos = clamp(int(cursor_pos), 0, len(input_text))
+    blink = math.sin(t * math.tau * 2.2) >= 0.0
+    cursor = "█" if blink else " "
+    prompt = "> " + input_text[:cursor_pos] + cursor + input_text[cursor_pos:]
+    prompt_s = font.render(prompt[-180:], True, (190, 255, 205))
+    panel.blit(prompt_s, (18, panel_h - 39))
+
+    footer = "toggle: ` / Ctrl+Shift+F1   Enter=run   Esc=close   Up/Down=history   PgUp/PgDn=scroll   Ctrl+L=clear"
+    footer_s = tiny.render(footer, True, (140, 195, 202))
+    panel.blit(footer_s, (18, panel_h - 17))
+
+    draw_surface_2d(panel, DISPLAY[0] // 2, 54 + panel_h // 2)
+
 def draw_title_screen(t: float, score: int, best_escape: int, highest_level: int):
     """Render the not-playing title state."""
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -2484,7 +2647,7 @@ def _route_candidate_clear(candidate_aabb, existing_aabbs) -> bool:
 
 def _route_allowed_dirs():
     """Cardinal route directions available for the current difficulty mode."""
-    if COURSE_ROUTE_ENABLE_VERTICAL_AXIS:
+    if COURSE_ROUTE_ENABLE_VERTICAL_AXIS and debug_flag_enabled("route3d", True):
         return ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
     return ((1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1))
 
@@ -2497,7 +2660,9 @@ def _route_preferred_dir_for_index(idx: int):
     default spine cycles X/Z/Y so the maze occupies real 3D volume.
     """
     idx = max(0, int(idx))
-    if not COURSE_ROUTE_ENABLE_VERTICAL_AXIS or idx + 1 < COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL:
+    if (not COURSE_ROUTE_ENABLE_VERTICAL_AXIS or
+            not debug_flag_enabled("route3d", True) or
+            idx + 1 < COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL):
         return COURSE_ROUTE_2D_SPINE[idx % len(COURSE_ROUTE_2D_SPINE)]
     return COURSE_ROUTE_3D_SPINE[idx % len(COURSE_ROUTE_3D_SPINE)]
 
@@ -2512,7 +2677,11 @@ def _route_fallback_candidates(current_dir):
 
 
 def course_route_vertical_axis_active_for_level(level: int) -> bool:
-    return bool(COURSE_ROUTE_ENABLE_VERTICAL_AXIS and int(level) >= COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL)
+    return bool(
+        COURSE_ROUTE_ENABLE_VERTICAL_AXIS and
+        debug_flag_enabled("route3d", True) and
+        int(level) >= COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL
+    )
 
 
 def make_course_directions_for_level(level: int):
@@ -3058,6 +3227,8 @@ def laser_reveal_collision_armed(laser: LaserGrid, t: float) -> bool:
 
 def player_has_out_of_bounds_cells(player: "PlayerCube") -> bool:
     if player is None:
+        return False
+    if debug_flag_enabled("noclip", False) or not debug_flag_enabled("bounds", True):
         return False
     for cell in player.alive_cells:
         if not point_inside_course(player.cell_world_pos(cell), pad=BOUNDARY_DAMAGE_PAD * 0.45):
@@ -5618,6 +5789,8 @@ def render_flash_overlay():
 
 
 def damage_from_lasers(player: PlayerCube, t: float):
+    if not debug_flag_enabled("damage", True) or not debug_flag_enabled("lasers", True):
+        return 0
     if player_in_turn_laser_grace(player):
         return 0
 
@@ -5667,6 +5840,10 @@ def damage_from_lasers(player: PlayerCube, t: float):
 
 
 def damage_from_bounds(player: PlayerCube):
+    if (not debug_flag_enabled("damage", True) or
+            not debug_flag_enabled("bounds", True) or
+            debug_flag_enabled("noclip", False)):
+        return 0
     # Bounds are less aggressive than lasers: shave cells that protrude outside the cage.
     victims = []
     for cell in list(player.alive_cells):
@@ -5769,6 +5946,8 @@ def portal_overlap_charge(player: PlayerCube) -> float:
 def portal_reached(player: PlayerCube) -> bool:
     # One cube cell nicking the portal is no longer enough. The portal starts
     # reacting around half commitment, but transcendence requires going all in.
+    if not debug_flag_enabled("portal", True):
+        return False
     if PORTAL_MODULE is None or player.intact_count() <= 0:
         return False
 
@@ -5783,7 +5962,9 @@ def apply_portal_suction(player: PlayerCube, dt: float):
     with the square exit. The goal is to make the portal behave like an exit that
     swallows the cube volume instead of a brittle centre-point checkpoint.
     """
-    if not PORTAL_SUCTION_ENABLED or PORTAL_MODULE is None or player is None:
+    if (not PORTAL_SUCTION_ENABLED or
+            not debug_flag_enabled("suction", True) or
+            PORTAL_MODULE is None or player is None):
         return
     if player.intact_count() <= 0 or dt <= 0.0:
         return
@@ -6692,10 +6873,11 @@ def handle_input(player: PlayerCube, dt: float):
     # damage/collision is handled by point_inside_course(), i.e. the L-pipe union.
     # Let the player drift outside the cage far enough to be punished by
     # disintegration instead of turning the cage into a hard invisible wall.
-    xmin, xmax, ymin, ymax, zmin, zmax = course_aabb(5.0)
-    player.origin.x = clamp(player.origin.x, xmin, xmax)
-    player.origin.y = clamp(player.origin.y, ymin, ymax)
-    player.origin.z = clamp(player.origin.z, zmin, zmax)
+    if not debug_flag_enabled("noclip", False):
+        xmin, xmax, ymin, ymax, zmin, zmax = course_aabb(5.0)
+        player.origin.x = clamp(player.origin.x, xmin, xmax)
+        player.origin.y = clamp(player.origin.y, ymin, ymax)
+        player.origin.z = clamp(player.origin.z, zmin, zmax)
 
 
 def draw_scene(player: PlayerCube, t: float, scene_angles, draw_player_body: bool = True, recoupling_particles=None, recoupling_progress: float = 0.0, center_on_player: bool = False):
@@ -6846,6 +7028,19 @@ def main():
     recoupling_cooldown_remaining = 0.0
     recoupling_cooldown_used = 0
     recoupling_cooldown_limit = recoupling_request_limit_for_level(current_level)
+
+    debug_console_open = False
+    debug_console_previous_paused = False
+    debug_console_input = ""
+    debug_console_cursor = 0
+    debug_console_log = [
+        "[INFO] Cube Libre debug console ready. Type 'help'.",
+        "[INFO] Toggle with ` or Ctrl+Shift+F1. Opening the console pauses the game.",
+    ]
+    debug_console_history = []
+    debug_console_history_index = None
+    debug_console_scroll = 0
+    debug_console_ignore_textinput_once = False
 
     setup_level_geometry(current_level)
 
@@ -7090,6 +7285,349 @@ def main():
         audio_stop_all(fade_ms=220)
         set_message("TITLE SCREEN", 0.8)
 
+    def debug_log(line: str):
+        nonlocal debug_console_scroll
+        for part in str(line).splitlines() or [""]:
+            debug_console_log.append(part)
+        if len(debug_console_log) > DEBUG_CONSOLE_MAX_LOG_LINES:
+            del debug_console_log[:-DEBUG_CONSOLE_MAX_LOG_LINES]
+        debug_console_scroll = min(debug_console_scroll, max(0, len(debug_console_log) - 1))
+
+    def open_debug_console(ignore_textinput_once: bool = False):
+        nonlocal debug_console_open, debug_console_previous_paused, paused
+        nonlocal reset_confirm_active, show_help_overlay, debug_console_ignore_textinput_once, debug_console_scroll
+        if not DEBUG_CONSOLE_ENABLED:
+            set_message("DEBUG CONSOLE DISABLED", 0.75)
+            return
+        if debug_console_open:
+            return
+        debug_console_open = True
+        debug_console_previous_paused = paused
+        debug_console_ignore_textinput_once = bool(ignore_textinput_once)
+        debug_console_scroll = 0
+        reset_confirm_active = False
+        show_help_overlay = False
+        if DEBUG_CONSOLE_PAUSES_GAME:
+            paused = True
+            audio_pause_all()
+        try:
+            pygame.key.start_text_input()
+        except Exception:
+            pass
+        debug_log("[INFO] console opened; game state restored on close")
+
+    def close_debug_console():
+        nonlocal debug_console_open, paused, debug_console_ignore_textinput_once
+        if not debug_console_open:
+            return
+        debug_console_open = False
+        debug_console_ignore_textinput_once = False
+        try:
+            pygame.key.stop_text_input()
+        except Exception:
+            pass
+        if DEBUG_CONSOLE_PAUSES_GAME:
+            paused = debug_console_previous_paused
+            if not paused:
+                audio_resume_all()
+        set_message("DEBUG CONSOLE CLOSED", 0.55)
+
+    def toggle_debug_console(ignore_textinput_once: bool = False):
+        if debug_console_open:
+            close_debug_console()
+        else:
+            open_debug_console(ignore_textinput_once=ignore_textinput_once)
+
+    def set_debug_flag(name: str, value: bool):
+        key = str(name).strip().lower()
+        if key not in DEBUG_FLAGS:
+            raise KeyError(f"unknown flag '{name}'")
+        DEBUG_FLAGS[key] = bool(value)
+        # Some flags affect generated/cached level geometry. Rebuild in-place so
+        # route3d changes immediately instead of waiting for the next run.
+        if key == "route3d":
+            setup_level_geometry(current_level)
+            clear_level_runtime_effects(clear_impact_particles=True)
+        return key, DEBUG_FLAGS[key]
+
+    def debug_set_player_cube_count(count: int):
+        count = int(clamp(int(count), 0, MAX_CELLS))
+        all_cells = [
+            (x, y, z)
+            for x in centered_coords(CUBE_SIZE)
+            for y in centered_coords(CUBE_SIZE)
+            for z in centered_coords(CUBE_SIZE)
+        ]
+        all_cells.sort(key=lambda c: (c[0] * c[0] + c[1] * c[1] + c[2] * c[2], abs(c[0]) + abs(c[1]) + abs(c[2]), c))
+        player.alive_cells = set(all_cells[:count])
+        if count >= MAX_CELLS:
+            player.fragments.clear()
+        return count
+
+    def execute_debug_command(command: str):
+        nonlocal score, paused, locate_camera_enabled, debug_console_scroll
+        command = command.strip()
+        if not command:
+            return
+        debug_log("> " + command)
+        try:
+            parts = shlex.split(command)
+        except ValueError as exc:
+            debug_log(f"[ERR] parse error: {exc}")
+            return
+        if not parts:
+            return
+
+        cmd = parts[0].lower()
+
+        try:
+            if cmd in ("help", "?"):
+                debug_log("[INFO] commands: help, clear, flags, get <flag>, set <flag> <on|off>, toggle <flag>")
+                debug_log("[INFO] flags: damage lasers bounds noclip portal suction route3d")
+                debug_log("[INFO] run: level <n>, restart, newrun, title, kill, heal, cubes <n>, portal, pos, route, score [n], locate <on|off>")
+                debug_log("[INFO] shortcuts: ` or Ctrl+Shift+F1 toggles console; Esc closes; Ctrl+L clears log")
+                return
+
+            if cmd in ("clear", "cls"):
+                debug_console_log[:] = []
+                debug_console_scroll = 0
+                return
+
+            if cmd == "flags":
+                for name in sorted(DEBUG_FLAGS):
+                    debug_log(f"[INFO] {name} = {debug_bool_text(DEBUG_FLAGS[name])}")
+                return
+
+            if cmd == "get":
+                if len(parts) != 2:
+                    debug_log("[ERR] usage: get <flag>")
+                    return
+                name = parts[1].lower()
+                if name not in DEBUG_FLAGS:
+                    debug_log(f"[ERR] unknown flag '{name}'")
+                    return
+                debug_log(f"[INFO] {name} = {debug_bool_text(DEBUG_FLAGS[name])}")
+                return
+
+            if cmd in ("set", "flag"):
+                if len(parts) != 3:
+                    debug_log("[ERR] usage: set <flag> <on|off>")
+                    return
+                name, value = set_debug_flag(parts[1], debug_parse_bool_token(parts[2]))
+                debug_log(f"[OK] {name} = {debug_bool_text(value)}")
+                return
+
+            if cmd == "toggle":
+                if len(parts) != 2:
+                    debug_log("[ERR] usage: toggle <flag>")
+                    return
+                key = parts[1].lower()
+                if key not in DEBUG_FLAGS:
+                    debug_log(f"[ERR] unknown flag '{key}'")
+                    return
+                name, value = set_debug_flag(key, not DEBUG_FLAGS[key])
+                debug_log(f"[OK] {name} = {debug_bool_text(value)}")
+                return
+
+            if cmd in DEBUG_FLAGS:
+                if len(parts) == 1:
+                    name, value = set_debug_flag(cmd, not DEBUG_FLAGS[cmd])
+                elif len(parts) == 2:
+                    name, value = set_debug_flag(cmd, debug_parse_bool_token(parts[1]))
+                else:
+                    debug_log(f"[ERR] usage: {cmd} [on|off]")
+                    return
+                debug_log(f"[OK] {name} = {debug_bool_text(value)}")
+                return
+
+            if cmd == "level":
+                if len(parts) != 2:
+                    debug_log("[ERR] usage: level <n>")
+                    return
+                target = max(1, int(parts[1]))
+                begin_level_ready(target, f"DEBUG LEVEL {target}")
+                debug_log(f"[OK] starting level {target}")
+                return
+
+            if cmd == "restart":
+                restart_current_level("DEBUG RESTART")
+                debug_log(f"[OK] restarting level {current_level}")
+                return
+
+            if cmd in ("newrun", "new", "run"):
+                start_new_run("DEBUG NEW RUN")
+                debug_log("[OK] new run")
+                return
+
+            if cmd == "title":
+                return_to_title()
+                debug_log("[OK] returned to title")
+                return
+
+            if cmd == "kill":
+                player.alive_cells.clear()
+                player.fragments.clear()
+                debug_log("[OK] cube killed")
+                return
+
+            if cmd == "heal":
+                debug_set_player_cube_count(MAX_CELLS)
+                player.fragments.clear()
+                debug_log(f"[OK] cube restored to {MAX_CELLS}/{MAX_CELLS}")
+                return
+
+            if cmd == "cubes":
+                if len(parts) != 2:
+                    debug_log("[ERR] usage: cubes <0..125>")
+                    return
+                count = debug_set_player_cube_count(int(parts[1]))
+                debug_log(f"[OK] cube count set to {count}/{MAX_CELLS}")
+                return
+
+            if cmd == "portal":
+                if PORTAL_MODULE is None:
+                    debug_log("[ERR] portal module is unavailable")
+                    return
+                player.origin = PORTAL_MODULE.local_to_world(PORTAL_LOCAL_X - 5.0, 0.0, 0.0)
+                debug_log(f"[OK] moved player near portal at {player.origin.as_tuple()}")
+                return
+
+            if cmd in ("pos", "where"):
+                active_idx, active_lx = player_module_location(player)
+                debug_log(f"[INFO] pos = x:{player.origin.x:.2f} y:{player.origin.y:.2f} z:{player.origin.z:.2f}")
+                debug_log(f"[INFO] module = {active_idx + 1}/{len(COURSE_MODULES)} local_x={active_lx:.2f}")
+                return
+
+            if cmd == "route":
+                debug_log(f"[INFO] route3d = {debug_bool_text(DEBUG_FLAGS.get('route3d', True))}")
+                debug_log(f"[INFO] directions = {make_course_directions_for_level(current_level)}")
+                return
+
+            if cmd == "score":
+                if len(parts) == 1:
+                    debug_log(f"[INFO] score = {score}")
+                elif len(parts) == 2:
+                    score = int(parts[1])
+                    debug_log(f"[OK] score = {score}")
+                else:
+                    debug_log("[ERR] usage: score [n]")
+                return
+
+            if cmd == "locate":
+                if len(parts) == 1:
+                    locate_camera_enabled = not locate_camera_enabled
+                elif len(parts) == 2:
+                    locate_camera_enabled = debug_parse_bool_token(parts[1])
+                else:
+                    debug_log("[ERR] usage: locate [on|off]")
+                    return
+                debug_log(f"[OK] locate camera = {debug_bool_text(locate_camera_enabled)}")
+                return
+
+            debug_log(f"[ERR] unknown command '{cmd}'")
+        except Exception as exc:
+            debug_log(f"[ERR] {exc.__class__.__name__}: {exc}")
+
+    def debug_console_insert_text(text_value: str):
+        nonlocal debug_console_input, debug_console_cursor
+        if not text_value:
+            return
+        # Keep console line sane; command history/log carries the long stuff.
+        text_value = "".join(ch for ch in text_value if ch >= " " and ch not in "\r\n\t")
+        if not text_value:
+            return
+        debug_console_input = (
+            debug_console_input[:debug_console_cursor] +
+            text_value +
+            debug_console_input[debug_console_cursor:]
+        )
+        debug_console_cursor += len(text_value)
+        debug_console_input = debug_console_input[:240]
+        debug_console_cursor = clamp(debug_console_cursor, 0, len(debug_console_input))
+
+    def handle_debug_console_key(event):
+        nonlocal debug_console_input, debug_console_cursor, debug_console_history_index, debug_console_scroll
+        mods = pygame.key.get_mods()
+        ctrl_down = bool(mods & pygame.KMOD_CTRL)
+
+        if event.key == pygame.K_ESCAPE:
+            close_debug_console()
+            return
+
+        if ctrl_down and event.key == pygame.K_l:
+            debug_console_log[:] = []
+            debug_console_scroll = 0
+            return
+
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            command = debug_console_input.strip()
+            if command:
+                debug_console_history.append(command)
+                if len(debug_console_history) > 80:
+                    del debug_console_history[:-80]
+                debug_console_history_index = None
+                debug_console_scroll = 0
+                execute_debug_command(command)
+            debug_console_input = ""
+            debug_console_cursor = 0
+            return
+
+        if event.key == pygame.K_BACKSPACE:
+            if debug_console_cursor > 0:
+                debug_console_input = debug_console_input[:debug_console_cursor - 1] + debug_console_input[debug_console_cursor:]
+                debug_console_cursor -= 1
+            return
+
+        if event.key == pygame.K_DELETE:
+            if debug_console_cursor < len(debug_console_input):
+                debug_console_input = debug_console_input[:debug_console_cursor] + debug_console_input[debug_console_cursor + 1:]
+            return
+
+        if event.key == pygame.K_LEFT:
+            debug_console_cursor = max(0, debug_console_cursor - 1)
+            return
+
+        if event.key == pygame.K_RIGHT:
+            debug_console_cursor = min(len(debug_console_input), debug_console_cursor + 1)
+            return
+
+        if event.key == pygame.K_HOME:
+            debug_console_cursor = 0
+            return
+
+        if event.key == pygame.K_END:
+            debug_console_cursor = len(debug_console_input)
+            return
+
+        if event.key == pygame.K_PAGEUP:
+            debug_console_scroll = min(max(0, len(debug_console_log) - 1), debug_console_scroll + DEBUG_CONSOLE_VISIBLE_LOG_LINES)
+            return
+
+        if event.key == pygame.K_PAGEDOWN:
+            debug_console_scroll = max(0, debug_console_scroll - DEBUG_CONSOLE_VISIBLE_LOG_LINES)
+            return
+
+        if event.key == pygame.K_UP:
+            if debug_console_history:
+                if debug_console_history_index is None:
+                    debug_console_history_index = len(debug_console_history) - 1
+                else:
+                    debug_console_history_index = max(0, debug_console_history_index - 1)
+                debug_console_input = debug_console_history[debug_console_history_index]
+                debug_console_cursor = len(debug_console_input)
+            return
+
+        if event.key == pygame.K_DOWN:
+            if debug_console_history and debug_console_history_index is not None:
+                debug_console_history_index += 1
+                if debug_console_history_index >= len(debug_console_history):
+                    debug_console_history_index = None
+                    debug_console_input = ""
+                else:
+                    debug_console_input = debug_console_history[debug_console_history_index]
+                debug_console_cursor = len(debug_console_input)
+            return
+
     running = True
     while running:
         raw_dt = clock.tick(FPS_LIMIT) / 1000.0
@@ -7122,12 +7660,29 @@ def main():
                     set_game_display(size, fullscreen=False)
                 else:
                     apply_gl_viewport_for_display(size, force=True)
+            elif event.type == getattr(pygame, "TEXTINPUT", -1):
+                if debug_console_open:
+                    if debug_console_ignore_textinput_once:
+                        debug_console_ignore_textinput_once = False
+                    else:
+                        debug_console_insert_text(getattr(event, "text", ""))
+                    continue
+
             elif event.type == pygame.KEYDOWN:
                 mods = pygame.key.get_mods()
                 alt_down = bool(mods & pygame.KMOD_ALT)
+
+                if is_debug_console_toggle_key(event.key, mods):
+                    toggle_debug_console(ignore_textinput_once=(event.key == getattr(pygame, "K_BACKQUOTE", None)))
+                    continue
+
                 if (event.key == pygame.K_f and alt_down) or event.key == pygame.K_F11 or (event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and alt_down):
                     fs = toggle_fullscreen()
                     set_message("FULLSCREEN" if fs else "WINDOWED", 0.9)
+                    continue
+
+                if debug_console_open:
+                    handle_debug_console_key(event)
                     continue
 
                 if reset_confirm_active:
@@ -7524,7 +8079,7 @@ def main():
                         else:
                             render_recoupling_recovery_prompt(player, t, recoupling_active=bool(recoupling_particles))
 
-        if paused:
+        if paused and not debug_console_open:
             render_pause_overlay(pause_ui_t, locate_camera_enabled)
 
         if reset_confirm_active:
@@ -7532,6 +8087,20 @@ def main():
 
         if show_help_overlay:
             render_help_overlay(t if not paused else pause_ui_t, game_state, current_level)
+
+        if debug_console_open:
+            render_debug_console(
+                pause_ui_t,
+                debug_console_input,
+                debug_console_cursor,
+                debug_console_log,
+                debug_console_scroll,
+                game_state,
+                current_level,
+                player,
+                score,
+                paused,
+            )
 
         pygame.display.flip()
 
@@ -7544,7 +8113,7 @@ def main():
             pygame.display.set_caption(
                 f"Cube Libre v.{version_number} | state: {game_state} | level: {current_level} | intact: {player.intact_count():3d}/{MAX_CELLS} | "
                 f"score: {score} | best: {best_escape}/{MAX_CELLS} | highest level: {highest_level} | "
-                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc title/quit confirm | H help | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset options{msg}"
+                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc title/quit confirm | H help | ` / Ctrl+Shift+F1 console | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset options{msg}"
             )
             caption_timer = 0.12
 

@@ -56,6 +56,8 @@ STEPS = 32
 ROWS = 24
 BASE_MIDI = 48  # C3
 DEFAULT_BPM = 120
+BPM_MIN = 1
+BPM_MAX = 999
 DEFAULT_SWING = 0.0
 STEP_BEATS = 0.25  # 16th notes
 MAX_POLY_PER_TRACK_STEP = 4
@@ -94,6 +96,8 @@ ASSET_TARGETS = {
 }
 
 WAVEFORMS = ["sine", "square", "saw", "triangle", "noise", "fm", "ring", "pluck"]
+REVERB_TYPES = ["room", "hall", "plate", "metal", "space"]
+DELAY_TYPES = ["mono", "pingpong", "tape", "diffuse"]
 PARAMS = [
     "wave",
     "gain",
@@ -238,6 +242,18 @@ def render_text(font, text, color=(220, 235, 235)):
 # -----------------------------------------------------------------------------
 
 
+def default_fx() -> dict:
+    return {
+        "reverb_amount": 0.0,
+        "reverb_length": 1.20,
+        "reverb_type": "room",
+        "delay_amount": 0.0,
+        "delay_length": 0.35,
+        "delay_feedback": 0.35,
+        "delay_type": "mono",
+    }
+
+
 def default_track(index: int) -> dict:
     waves = ["fm", "saw", "noise", "triangle"]
     names = ["FM bite", "saw stab", "noise ash", "tri pulse"]
@@ -262,6 +278,7 @@ def default_track(index: int) -> dict:
             "cutoff": 0.80,
             "drive": 0.10,
         },
+        "fx": default_fx(),
         "notes": [],
     }
 
@@ -331,7 +348,7 @@ def validate_patch(patch: dict) -> dict:
     p = copy.deepcopy(patch)
     p.setdefault("version", 1)
     p.setdefault("name", "cube-libre-patch")
-    p["bpm"] = int(clamp(int(p.get("bpm", DEFAULT_BPM)), 40, 260))
+    p["bpm"] = int(clamp(int(p.get("bpm", DEFAULT_BPM)), BPM_MIN, BPM_MAX))
     p["swing"] = float(clamp(float(p.get("swing", 0.0)), -0.45, 0.45))
     p["steps"] = int(clamp(int(p.get("steps", STEPS)), 8, 128))
     p["rows"] = int(clamp(int(p.get("rows", ROWS)), 12, 60))
@@ -352,6 +369,20 @@ def validate_patch(patch: dict) -> dict:
             params.setdefault(k, v)
         if params.get("wave") not in WAVEFORMS:
             params["wave"] = "sine"
+
+        fx = tr.setdefault("fx", {})
+        base_fx = default_fx()
+        for k, v in base_fx.items():
+            fx.setdefault(k, v)
+        fx["reverb_amount"] = float(clamp(float(fx.get("reverb_amount", 0.0)), 0.0, 1.0))
+        fx["reverb_length"] = float(clamp(float(fx.get("reverb_length", 1.20)), 0.05, 8.0))
+        if fx.get("reverb_type") not in REVERB_TYPES:
+            fx["reverb_type"] = "room"
+        fx["delay_amount"] = float(clamp(float(fx.get("delay_amount", 0.0)), 0.0, 1.0))
+        fx["delay_length"] = float(clamp(float(fx.get("delay_length", 0.35)), 0.02, 4.0))
+        fx["delay_feedback"] = float(clamp(float(fx.get("delay_feedback", 0.35)), 0.0, 0.92))
+        if fx.get("delay_type") not in DELAY_TYPES:
+            fx["delay_type"] = "mono"
         tr["notes"] = list(tr.get("notes") or [])[:10000]
     return p
 
@@ -558,12 +589,129 @@ def format_transport_time(seconds: float) -> str:
     return f"{mins:02d}:{secs:05.2f}"
 
 
+
+def _stereo_len(stereo) -> int:
+    return int(stereo.shape[0]) if np is not None and hasattr(stereo, "shape") else len(stereo)
+
+
+def effect_tail_seconds(patch: dict) -> float:
+    tail = 1.0
+    for tr in patch.get("tracks", []):
+        fx = tr.get("fx", {}) or {}
+        rv_amt = float(fx.get("reverb_amount", 0.0))
+        dl_amt = float(fx.get("delay_amount", 0.0))
+        if rv_amt > 0.0001:
+            tail = max(tail, float(fx.get("reverb_length", 1.2)) * (0.75 + rv_amt * 0.75))
+        if dl_amt > 0.0001:
+            fb = float(fx.get("delay_feedback", 0.35))
+            tail = max(tail, float(fx.get("delay_length", 0.35)) * (2.0 + fb * 7.0))
+    return float(clamp(tail, 1.0, 12.0))
+
+
+def _add_shifted_np(dst, src, shift: int, gain_l: float, gain_r: float, swap: bool = False):
+    if shift <= 0 or shift >= len(dst):
+        return
+    n = min(len(src), len(dst) - shift)
+    if n <= 0:
+        return
+    if swap:
+        dst[shift:shift+n, 0] += src[:n, 1] * gain_l
+        dst[shift:shift+n, 1] += src[:n, 0] * gain_r
+    else:
+        dst[shift:shift+n, 0] += src[:n, 0] * gain_l
+        dst[shift:shift+n, 1] += src[:n, 1] * gain_r
+
+
+def _add_shifted_list(dst, src, shift: int, gain_l: float, gain_r: float, swap: bool = False):
+    if shift <= 0 or shift >= len(dst):
+        return
+    n = min(len(src), len(dst) - shift)
+    for i in range(n):
+        sl, sr = src[i]
+        if swap:
+            sl, sr = sr, sl
+        dl, dr = dst[shift + i]
+        dst[shift + i] = (dl + sl * gain_l, dr + sr * gain_r)
+
+
+def _copy_stereo(stereo):
+    if np is not None and hasattr(stereo, "shape"):
+        return stereo.copy()
+    return list(stereo)
+
+
+def apply_track_fx(track_audio, fx: dict, sample_rate: int = SAMPLE_RATE):
+    """Apply cheap per-track delay/reverb to an already-rendered stereo track.
+
+    This is intentionally a fast multi-tap effect rack, not a physically accurate
+    reverb. Amount 0 really means bypass, so old patches stay unchanged.
+    """
+    if _stereo_len(track_audio) <= 0:
+        return track_audio
+    fx = fx or {}
+    rv_amt = float(clamp(float(fx.get("reverb_amount", 0.0)), 0.0, 1.0))
+    rv_len = float(clamp(float(fx.get("reverb_length", 1.2)), 0.05, 8.0))
+    rv_type = fx.get("reverb_type", "room") if fx.get("reverb_type", "room") in REVERB_TYPES else "room"
+    dl_amt = float(clamp(float(fx.get("delay_amount", 0.0)), 0.0, 1.0))
+    dl_len = float(clamp(float(fx.get("delay_length", 0.35)), 0.02, 4.0))
+    dl_fb = float(clamp(float(fx.get("delay_feedback", 0.35)), 0.0, 0.92))
+    dl_type = fx.get("delay_type", "mono") if fx.get("delay_type", "mono") in DELAY_TYPES else "mono"
+
+    if rv_amt <= 0.0001 and dl_amt <= 0.0001:
+        return track_audio
+
+    out = _copy_stereo(track_audio)
+    add_shifted = _add_shifted_np if np is not None and hasattr(out, "shape") else _add_shifted_list
+
+    if dl_amt > 0.0001:
+        base_shift = max(1, int(dl_len * sample_rate))
+        taps = 1 if dl_fb <= 0.02 else int(clamp(2 + dl_fb * 7, 2, 9))
+        for tap in range(1, taps + 1):
+            gain = dl_amt * (dl_fb ** (tap - 1)) * (0.62 if tap > 1 else 0.85)
+            if dl_type == "pingpong":
+                add_shifted(out, track_audio, base_shift * tap, gain * 0.92, gain * 0.92, swap=(tap % 2 == 1))
+            elif dl_type == "tape":
+                # slightly uneven, darker-ish repeats by decreasing gain faster
+                jitter = 1.0 + (0.018 * tap if tap % 2 else -0.012 * tap)
+                add_shifted(out, track_audio, int(base_shift * tap * jitter), gain * (0.82 ** tap), gain * (0.82 ** tap), swap=False)
+            elif dl_type == "diffuse":
+                add_shifted(out, track_audio, int(base_shift * tap * 0.77), gain * 0.55, gain * 0.50, swap=False)
+                add_shifted(out, track_audio, int(base_shift * tap * 1.13), gain * 0.42, gain * 0.48, swap=True)
+            else:
+                add_shifted(out, track_audio, base_shift * tap, gain, gain, swap=False)
+
+    if rv_amt > 0.0001:
+        type_mul = {
+            "room": (0.55, 0.75, 8),
+            "hall": (0.85, 1.00, 12),
+            "plate": (0.62, 0.92, 11),
+            "metal": (0.36, 0.88, 13),
+            "space": (1.10, 1.18, 15),
+        }.get(rv_type, (0.65, 0.9, 10))
+        early_mul, decay_mul, tap_count = type_mul
+        for tap in range(1, tap_count + 1):
+            frac = tap / float(tap_count + 1)
+            # Quadratic spacing gives denser early reflections and a longer tail.
+            seconds = 0.012 + (rv_len * early_mul) * (frac ** 1.75)
+            if rv_type == "metal":
+                seconds *= 0.78 + (tap % 3) * 0.12
+            shift = max(1, int(seconds * sample_rate))
+            gain = rv_amt * (1.0 - frac) ** decay_mul * 0.32
+            widen = 0.85 + 0.30 * ((tap % 2) == 0)
+            add_shifted(out, track_audio, shift, gain * widen, gain * (2.0 - widen), swap=(tap % 2 == 0))
+        # A few late grains for the big fake spaces.
+        if rv_type in ("hall", "space"):
+            for mul, g in ((0.55, 0.11), (0.82, 0.075), (1.07, 0.052)):
+                add_shifted(out, track_audio, int(rv_len * mul * sample_rate), rv_amt * g, rv_amt * g, swap=True)
+
+    return out
+
 def render_patch(patch: dict, include_tail: bool = True):
     patch = validate_patch(patch)
     steps = int(patch["steps"])
     step_sec = step_duration_seconds(patch)
     pattern_len = step_start_seconds(patch, steps - 1) + step_sec
-    tail = 1.0 if include_tail else 0.0
+    tail = effect_tail_seconds(patch) if include_tail else 0.0
     n = int((pattern_len + tail) * SAMPLE_RATE)
     mix = blank_stereo(n)
 
@@ -574,6 +722,7 @@ def render_patch(patch: dict, include_tail: bool = True):
         if solos and ti not in solos:
             continue
         params = tr.get("params", {})
+        track_mix = blank_stereo(n)
         notes_by_step: Dict[int, int] = {}
         for ni, note in enumerate(tr.get("notes", [])):
             st = int(note.get("step", 0))
@@ -587,7 +736,9 @@ def render_patch(patch: dict, include_tail: bool = True):
             dur = max(0.010, step_sec * length + float(params.get("release", 0.1)))
             seed = 1337 + ti * 100003 + ni * 313 + st * 17 + midi * 7
             snd = synth_note(params, midi, dur, vel, SAMPLE_RATE, seed)
-            add_stereo(mix, start, snd)
+            add_stereo(track_mix, start, snd)
+        track_mix = apply_track_fx(track_mix, tr.get("fx", {}), SAMPLE_RATE)
+        add_stereo(mix, 0, track_mix)
     return normalize_stereo(mix, 0.92)
 
 # -----------------------------------------------------------------------------
@@ -764,15 +915,21 @@ class AudioLabApp:
         self.last_render = None
         self.last_export_path: Optional[Path] = None
         self.dragging_slider: Optional[Slider] = None
+        self.dragging_fx_knob: Optional[Slider] = None
+        # Piano-roll note resizing: drag the right edge of a selected-track note
+        # to stretch/squeeze its length, DAW-style. Notes stay grid-snapped.
+        self.dragging_note_resize: Optional[dict] = None
         self.preview_dirty = True
         self.render_in_progress = False
         self.patch_files: List[Path] = []
         self.patch_file_index = 0
         self.sliders: Dict[str, Slider] = {}
+        self.fx_knobs: Dict[str, Slider] = {}
         self.buttons: Dict[str, pygame.Rect] = {}
         self.grid_rect = pygame.Rect(0, 0, 1, 1)
         self.param_x = 850
         self.param_rect = pygame.Rect(835, 104, max(1, WINDOW_W - 835), max(1, WINDOW_H - 104))
+        self.fx_bin_rect = pygame.Rect(0, 0, 1, 1)
         self.track_row_h = 30
         self.step_w = 1
         self.row_h = 1
@@ -939,7 +1096,7 @@ class AudioLabApp:
         old_pos = self.current_position_seconds()
         old_frac_step = old_pos / old_step
         old_bpm = int(self.patch.get("bpm", DEFAULT_BPM))
-        new_bpm = int(clamp(int(bpm_value), 40, 260))
+        new_bpm = int(clamp(int(bpm_value), BPM_MIN, BPM_MAX))
         if new_bpm == old_bpm:
             self.status = f"{status_prefix} {new_bpm} BPM"
             return
@@ -989,10 +1146,10 @@ class AudioLabApp:
         except ValueError:
             self.status = "BPM must be a number"
             return
-        clipped = int(clamp(bpm, 40, 260))
+        clipped = int(clamp(bpm, BPM_MIN, BPM_MAX))
         self.set_bpm_absolute(clipped, status_prefix="typed tempo")
         if clipped != bpm:
-            self.status += " (clamped 40-260)"
+            self.status += f" (clamped {BPM_MIN}-{BPM_MAX})"
 
     def handle_bpm_edit_keydown(self, event) -> bool:
         if not self.bpm_editing:
@@ -1132,6 +1289,21 @@ class AudioLabApp:
     def current_params(self):
         return self.patch["tracks"][self.selected_track]["params"]
 
+    def current_fx(self):
+        tr = self.patch["tracks"][self.selected_track]
+        fx = tr.setdefault("fx", default_fx())
+        for k, v in default_fx().items():
+            fx.setdefault(k, v)
+        return fx
+
+    def set_fx_value(self, name: str, value):
+        fx = self.current_fx()
+        if name in ("reverb_type", "delay_type"):
+            fx[name] = str(value)
+        else:
+            fx[name] = float(value)
+        self.preview_dirty = True
+
     def set_param_value(self, name: str, value):
         p = self.current_params()
         if name == "wave":
@@ -1255,6 +1427,44 @@ class AudioLabApp:
             rect = pygame.Rect(param_x + 90, param_y + i * 38 + 6, max(180, WINDOW_W - param_x - 118), 13)
             self.sliders[name] = Slider(name, rect, lo, hi, float(p.get(name, 0.0)), step)
 
+        # Lower-right per-track effects bay. Deliberately separate from the synth
+        # sliders so the patch can store both dry synth shape and post-FX shape.
+        self.fx_knobs = {}
+        slider_bottom = max((sl.rect.bottom for sl in self.sliders.values()), default=param_y + 60)
+        fx_y = slider_bottom + 12
+        fx_w = max(260, WINDOW_W - param_x - 28)
+        fx_h = max(138, min(190, WINDOW_H - fx_y - 12))
+        self.fx_bin_rect = pygame.Rect(param_x, fx_y, fx_w, fx_h)
+        fx = self.current_fx()
+        knob_defs = [
+            ("reverb_amount", 0.0, 1.0, 0.01),
+            ("reverb_length", 0.05, 8.0, 0.05),
+            ("delay_amount", 0.0, 1.0, 0.01),
+            ("delay_length", 0.02, 4.0, 0.02),
+            ("delay_feedback", 0.0, 0.92, 0.01),
+        ]
+        knob_spacing = min(72, max(54, (fx_w - 26) // 5))
+        knob_size = 38
+        knob_y = fx_y + 34
+        start_x = param_x + 12
+        for i, (name, lo, hi, step) in enumerate(knob_defs):
+            rect = pygame.Rect(start_x + i * knob_spacing, knob_y, knob_size, knob_size)
+            self.fx_knobs[name] = Slider(name, rect, lo, hi, float(fx.get(name, default_fx().get(name, lo))), step)
+
+        # Type buttons live inside the FX bay and are drawn there, not in the top UI.
+        type_y1 = fx_y + 88
+        type_y2 = fx_y + 118
+        bw = max(40, min(54, (fx_w - 84) // len(REVERB_TYPES) - 4))
+        xbtn = param_x + 62
+        for tname in REVERB_TYPES:
+            self.buttons[f"fx_reverb_type_{tname}"] = pygame.Rect(xbtn, type_y1, bw, 22)
+            xbtn += bw + 4
+        bw2 = max(52, min(70, (fx_w - 84) // len(DELAY_TYPES) - 4))
+        xbtn = param_x + 62
+        for tname in DELAY_TYPES:
+            self.buttons[f"fx_delay_type_{tname}"] = pygame.Rect(xbtn, type_y2, bw2, 22)
+            xbtn += bw2 + 4
+
         grid_left = 70
         grid_top = 136
         grid_right = param_x - 18
@@ -1282,6 +1492,60 @@ class AudioLabApp:
         midi = int(self.patch.get("base_midi", BASE_MIDI)) + (rows - 1 - row)
         midi = int(clamp(midi, self.patch.get("base_midi", BASE_MIDI), self.patch.get("base_midi", BASE_MIDI) + rows - 1))
         return step, midi
+
+    def note_rect_for(self, note: dict, base: Optional[int] = None, rows: Optional[int] = None) -> Optional[pygame.Rect]:
+        """Screen rectangle for a note in the current piano roll."""
+        gr = self.grid_rect
+        if base is None:
+            base = int(self.patch.get("base_midi", BASE_MIDI))
+        if rows is None:
+            rows = int(self.patch.get("rows", ROWS))
+        step = int(note.get("step", 0))
+        midi = int(note.get("midi", base))
+        length = int(max(1, note.get("length", 1)))
+        if not (base <= midi <= base + rows - 1):
+            return None
+        row = rows - 1 - (midi - base)
+        x = gr.x + step * self.step_w + 2
+        y = gr.y + row * self.row_h + 2
+        w = max(3, self.step_w * length - 4)
+        h = max(3, self.row_h - 4)
+        return pygame.Rect(int(x), int(y), int(w), int(h))
+
+    def note_resize_hit_at_mouse(self, pos) -> Optional[dict]:
+        """Return a selected-track note if the mouse is on its right resize handle."""
+        if not self.grid_rect.collidepoint(pos):
+            return None
+        base = int(self.patch.get("base_midi", BASE_MIDI))
+        rows = int(self.patch.get("rows", ROWS))
+        # Scan from topmost/latest note backwards so overlapping handles pick the visible note.
+        notes = self.patch["tracks"][self.selected_track].get("notes", [])
+        for n in reversed(notes):
+            rect = self.note_rect_for(n, base, rows)
+            if not rect:
+                continue
+            handle_w = max(6, min(12, int(self.step_w * 0.38)))
+            handle = pygame.Rect(rect.right - handle_w, rect.y - 2, handle_w + 3, rect.h + 4)
+            if handle.collidepoint(pos):
+                return n
+        return None
+
+    def update_note_resize_from_mouse(self, x: int):
+        """Grid-snapped right-edge note stretch/squeeze."""
+        if not self.dragging_note_resize:
+            return
+        note = self.dragging_note_resize["note"]
+        steps = int(self.patch.get("steps", STEPS))
+        start_step = int(note.get("step", 0))
+        # Treat the mouse x as a right-edge grid boundary, not a cell centre.
+        end_step = int(round((x - self.grid_rect.x) / max(1e-6, self.step_w)))
+        end_step = int(clamp(end_step, start_step + 1, steps))
+        new_len = int(clamp(end_step - start_step, 1, steps - start_step))
+        if int(note.get("length", 1)) != new_len:
+            note["length"] = new_len
+            self.selected_note_len = new_len
+            self.preview_dirty = True
+            self.status = f"resized note: step {start_step + 1}, length {new_len}"
 
     def toggle_note(self, step: int, midi: int, erase: bool = False):
         tr = self.selected_track
@@ -1354,6 +1618,16 @@ class AudioLabApp:
             self.change_bpm(1)
         elif key == "bpm_display":
             self.begin_bpm_edit()
+        elif key.startswith("fx_reverb_type_"):
+            tname = key.replace("fx_reverb_type_", "", 1)
+            if tname in REVERB_TYPES:
+                self.set_fx_value("reverb_type", tname)
+                self.status = f"reverb type: {tname}"
+        elif key.startswith("fx_delay_type_"):
+            tname = key.replace("fx_delay_type_", "", 1)
+            if tname in DELAY_TYPES:
+                self.set_fx_value("delay_type", tname)
+                self.status = f"delay type: {tname}"
         elif key == "base_down":
             self.patch["base_midi"] = int(clamp(int(self.patch.get("base_midi", BASE_MIDI)) - 12, 12, 84)); self.preview_dirty = True
         elif key == "base_up":
@@ -1453,23 +1727,57 @@ class AudioLabApp:
                 return
         if self.bpm_editing:
             self.commit_bpm_edit()
+
+        # DAW-style note resizing: left-drag the right edge of a note in the
+        # selected track. This must be checked before grid toggle/erase.
+        if event.button == 1:
+            hit_note = self.note_resize_hit_at_mouse(pos)
+            if hit_note is not None:
+                self.dragging_note_resize = {
+                    "track": self.selected_track,
+                    "note": hit_note,
+                    "original_length": int(hit_note.get("length", 1)),
+                }
+                self.update_note_resize_from_mouse(pos[0])
+                self.status = "drag note right edge to stretch/squeeze"
+                return
+
         for name, slider in self.sliders.items():
             if slider.rect.inflate(0, 12).collidepoint(pos):
                 self.dragging_slider = slider
                 slider.set_from_x(pos[0])
                 self.set_param_value(name, slider.value)
                 return
+        for name, knob in self.fx_knobs.items():
+            if knob.rect.inflate(16, 18).collidepoint(pos):
+                self.dragging_fx_knob = knob
+                knob.set_from_x(pos[0])
+                self.set_fx_value(name, knob.value)
+                self.status = f"FX {name} {knob.value:.2f}"
+                return
         n = self.note_at_mouse(pos)
         if n:
             self.toggle_note(n[0], n[1], erase=(event.button == 3))
 
     def handle_mouse_motion(self, event):
+        if self.dragging_note_resize:
+            self.update_note_resize_from_mouse(event.pos[0])
+            return
         if self.dragging_slider:
             self.dragging_slider.set_from_x(event.pos[0])
             self.set_param_value(self.dragging_slider.name, self.dragging_slider.value)
+        if self.dragging_fx_knob:
+            self.dragging_fx_knob.set_from_x(event.pos[0])
+            self.set_fx_value(self.dragging_fx_knob.name, self.dragging_fx_knob.value)
 
     def handle_mouse_up(self, event):
+        if self.dragging_note_resize:
+            note = self.dragging_note_resize.get("note")
+            if note is not None:
+                self.status = f"note length: {int(note.get('length', 1))} step(s)"
         self.dragging_slider = None
+        self.dragging_fx_knob = None
+        self.dragging_note_resize = None
 
     def handle_events(self):
         for event in pygame.event.get():
@@ -1593,7 +1901,7 @@ class AudioLabApp:
         self.draw_transport()
         for key, rect in self.buttons.items():
             if (key.startswith("transport_") or key.startswith("track_") or key.startswith("mute_") or
-                    key.startswith("solo_") or key in ("len_minus", "len_plus", "vel_minus", "vel_plus",
+                    key.startswith("solo_") or key.startswith("fx_") or key in ("len_minus", "len_plus", "vel_minus", "vel_plus",
                     "bpm_display", "bpm_up", "bpm_down", "base_down", "base_up")):
                 continue
             label = {
@@ -1676,20 +1984,90 @@ class AudioLabApp:
                 length = int(n.get("length", 1))
                 if not (base <= midi <= base + rows - 1):
                     continue
-                row = rows - 1 - (midi - base)
-                x = gr.x + step * self.step_w + 2
-                y = gr.y + row * self.row_h + 2
-                w = max(3, self.step_w * length - 4)
-                h = max(3, self.row_h - 4)
+                rect = self.note_rect_for(n, base, rows)
+                if rect is None:
+                    continue
                 if alpha_selected:
                     fill = col
                     border = (255, 255, 255)
                 else:
                     fill = tuple(int(c * 0.35) for c in col)
                     border = tuple(int(c * 0.55) for c in col)
-                rect = pygame.Rect(int(x), int(y), int(w), int(h))
                 pygame.draw.rect(self.screen, fill, rect, border_radius=3)
                 pygame.draw.rect(self.screen, border, rect, width=1, border_radius=3)
+                if alpha_selected:
+                    # Visible DAW-style resize grip on the right edge. Grab this
+                    # with left mouse and drag horizontally to stretch/squeeze.
+                    grip_w = max(4, min(8, int(self.step_w * 0.30)))
+                    grip = pygame.Rect(rect.right - grip_w, rect.y + 1, grip_w, max(2, rect.h - 2))
+                    pygame.draw.rect(self.screen, (235, 255, 245), grip, border_radius=2)
+                    pygame.draw.line(self.screen, (20, 55, 58), (grip.x, grip.y + 2), (grip.x, grip.bottom - 3), 1)
+
+    def draw_fx_knob(self, knob: Slider, label: str, value_text: str):
+        rect = knob.rect
+        cx, cy = rect.center
+        radius = min(rect.w, rect.h) // 2
+        pygame.draw.circle(self.screen, (9, 17, 19), (cx, cy), radius + 3)
+        pygame.draw.circle(self.screen, (34, 54, 58), (cx, cy), radius + 1)
+        pygame.draw.circle(self.screen, (18, 31, 34), (cx, cy), radius - 2)
+        # Pointer arc from roughly 225° to -45°.
+        a = math.radians(225.0 - knob.normalized() * 270.0)
+        px = cx + math.cos(a) * (radius - 6)
+        py = cy - math.sin(a) * (radius - 6)
+        pygame.draw.line(self.screen, (150, 238, 220), (cx, cy), (int(px), int(py)), 3)
+        pygame.draw.circle(self.screen, (220, 245, 240), (cx, cy), 3)
+        lab = self.small.render(label, True, (180, 210, 210))
+        val = self.small.render(value_text, True, (135, 178, 178))
+        self.screen.blit(lab, (cx - lab.get_width() // 2, rect.bottom + 1))
+        self.screen.blit(val, (cx - val.get_width() // 2, rect.y - 16))
+
+    def draw_fx_bin(self):
+        fx = self.current_fx()
+        r = self.fx_bin_rect
+        if r.w < 220 or r.h < 120:
+            return
+        pygame.draw.rect(self.screen, (12, 16, 18), r, border_radius=10)
+        pygame.draw.rect(self.screen, (45, 70, 74), r, width=1, border_radius=10)
+        pygame.draw.line(self.screen, (24, 34, 38), (r.x + 8, r.y + 24), (r.right - 8, r.y + 24), 1)
+        title = self.big.render("FX BIN", True, (210, 232, 228))
+        self.screen.blit(title, (r.x + 10, r.y + 4))
+        hint = self.small.render("per-track post FX", True, (115, 150, 150))
+        self.screen.blit(hint, (r.right - hint.get_width() - 10, r.y + 9))
+
+        labels = {
+            "reverb_amount": "rv amt",
+            "reverb_length": "rv len",
+            "delay_amount": "dl amt",
+            "delay_length": "dl len",
+            "delay_feedback": "fb",
+        }
+        for name, knob in self.fx_knobs.items():
+            knob.value = float(fx.get(name, knob.value))
+            val = f"{knob.value:.2f}"
+            if name.endswith("length"):
+                val = f"{knob.value:.2f}s"
+            self.draw_fx_knob(knob, labels.get(name, name), val)
+
+        # Type selectors. Active buttons get the same greenish accent as tracks.
+        rt = fx.get("reverb_type", "room")
+        dt = fx.get("delay_type", "mono")
+        rev_label = self.small.render("reverb", True, (150, 185, 185))
+        del_label = self.small.render("delay", True, (150, 185, 185))
+        # Draw labels if there is room to the left of the buttons.
+        first_rev = self.buttons.get(f"fx_reverb_type_{REVERB_TYPES[0]}")
+        first_del = self.buttons.get(f"fx_delay_type_{DELAY_TYPES[0]}")
+        if first_rev:
+            self.screen.blit(rev_label, (r.x + 10, first_rev.y + 4))
+        if first_del:
+            self.screen.blit(del_label, (r.x + 10, first_del.y + 4))
+        for tname in REVERB_TYPES:
+            rect = self.buttons.get(f"fx_reverb_type_{tname}")
+            if rect:
+                draw_button(self.screen, rect, tname[:5].upper(), self.small, active=(tname == rt))
+        for tname in DELAY_TYPES:
+            rect = self.buttons.get(f"fx_delay_type_{tname}")
+            if rect:
+                draw_button(self.screen, rect, tname[:6].upper(), self.small, active=(tname == dt))
 
     def draw_params(self):
         x = self.param_x
@@ -1715,17 +2093,18 @@ class AudioLabApp:
             pygame.draw.circle(self.screen, (220, 245, 240), (int(kx), slider.rect.centery), 7)
             pygame.draw.line(self.screen, (90, 210, 190), (slider.rect.x, slider.rect.centery), (int(kx), slider.rect.centery), 3)
 
+        self.draw_fx_bin()
+
         help_lines = [
-            "mouse L: toggle note   mouse R: erase note",
+            "mouse L: toggle note   drag note right edge: stretch/squeeze   mouse R: erase",
             "BPM: arrows/wheel nudge; double-click counter to type",
             "space play   enter render   ctrl+s save   ctrl+e export",
             "1-4 track   tab next   [/] waveform   R/P randomize",
             "JSON: tools/audio_lab_patches/",
             "WAV:  tools/audio_lab_exports/",
         ]
-        slider_bottom = max((sl.rect.bottom for sl in self.sliders.values()), default=y + 60)
-        hy = slider_bottom + 18
-        max_lines = max(0, (WINDOW_H - hy - 16) // 18)
+        hy = self.fx_bin_rect.bottom + 10
+        max_lines = max(0, (WINDOW_H - hy - 12) // 18)
         for line in help_lines[:max_lines]:
             s = self.small.render(line, True, (150, 185, 185))
             self.screen.blit(s, (x, hy)); hy += 18
