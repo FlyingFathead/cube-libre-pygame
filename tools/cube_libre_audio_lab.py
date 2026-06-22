@@ -771,9 +771,15 @@ class AudioLabApp:
         self.sliders: Dict[str, Slider] = {}
         self.buttons: Dict[str, pygame.Rect] = {}
         self.grid_rect = pygame.Rect(0, 0, 1, 1)
+        self.param_x = 850
+        self.param_rect = pygame.Rect(835, 104, max(1, WINDOW_W - 835), max(1, WINDOW_H - 104))
         self.track_row_h = 30
         self.step_w = 1
         self.row_h = 1
+        self.play_cursor_offset = 0.0
+        self.realtime_preview = True
+        self.last_realtime_refresh = 0.0
+        self.realtime_refresh_interval = 0.12
         self.refresh_patch_files()
         self.load_presets_into_dir_once()
 
@@ -799,12 +805,13 @@ class AudioLabApp:
         self.is_paused = False
         self.pause_started_at = 0.0
         self.pause_total = 0.0
+        self.play_cursor_offset = 0.0
         self.transport_cursor_seconds = clamp(float(cursor), 0.0, pattern_duration_seconds(self.patch))
 
     def rewind_to_start(self):
         self.transport_cursor_seconds = 0.0
         if self.is_playing:
-            self.play(force_render=False)
+            self.play(cursor=0.0, force_render=False)
         else:
             self.play_started_at = time.time()
             self.pause_started_at = 0.0
@@ -839,6 +846,9 @@ class AudioLabApp:
         pygame.display.set_caption("Cube Libre Audio Lab - rendering...")
         try:
             self.last_render = render_patch(self.patch, include_tail=True)
+            # current_sound is a full exported/render-preview sound. Actual transport
+            # playback is made from this buffer at the current cursor so tempo/synth
+            # edits can be re-applied while the song is running.
             self.current_sound = stereo_to_sound(self.last_render)
             self.status = f"rendered {len(self.last_render) / SAMPLE_RATE:.2f}s"
             self.preview_dirty = False
@@ -848,20 +858,96 @@ class AudioLabApp:
         finally:
             pygame.display.set_caption("Cube Libre Audio Lab - poor man's four-track beep crimes")
 
-    def play(self, force_render: bool = False):
-        if force_render or self.preview_dirty or self.current_sound is None:
+    def playback_sound_from_cursor(self, cursor: float):
+        if self.last_render is None:
+            return None
+        dur = max(0.001, pattern_duration_seconds(self.patch))
+        cursor = clamp(float(cursor), 0.0, dur)
+        pattern_n = max(1, int(dur * SAMPLE_RATE))
+        start = int(clamp(cursor / dur, 0.0, 0.999999) * pattern_n)
+
+        if self.loop_playback:
+            # Rotate the exact one-pattern buffer so the mixer can loop it forever
+            # while the playhead math still reports the real song position.
+            if np is not None and hasattr(self.last_render, "shape"):
+                pat = self.last_render[:pattern_n]
+                if len(pat) <= 0:
+                    return None
+                playbuf = np.concatenate((pat[start:], pat[:start]), axis=0)
+            else:
+                pat = self.last_render[:pattern_n]
+                if not pat:
+                    return None
+                playbuf = pat[start:] + pat[:start]
+        else:
+            # Non-loop mode keeps the rendered tail after the pattern.
+            if np is not None and hasattr(self.last_render, "shape"):
+                playbuf = self.last_render[start:]
+            else:
+                playbuf = self.last_render[start:]
+            if len(playbuf) <= 0:
+                return None
+        return stereo_to_sound(playbuf)
+
+    def play(self, force_render: bool = False, cursor: Optional[float] = None):
+        if cursor is None:
+            cursor = self.transport_cursor_seconds
+            if cursor >= pattern_duration_seconds(self.patch) - 1e-6:
+                cursor = 0.0
+        cursor = clamp(float(cursor), 0.0, pattern_duration_seconds(self.patch))
+        if force_render or self.preview_dirty or self.last_render is None:
             self.render_current()
-        if not self.current_sound:
+        sound = self.playback_sound_from_cursor(cursor)
+        if not sound:
             return
-        self.stop(cursor=0.0)
+        if self.play_channel:
+            self.play_channel.stop()
         loops = -1 if self.loop_playback else 0
-        self.play_channel.play(self.current_sound, loops=loops)
+        self.play_channel.play(sound, loops=loops)
         self.is_playing = True
         self.is_paused = False
+        self.play_cursor_offset = cursor
+        self.transport_cursor_seconds = cursor
         self.play_started_at = time.time()
         self.pause_started_at = 0.0
         self.pause_total = 0.0
         self.status = "playing"
+
+    def apply_live_changes_if_needed(self):
+        if not (self.realtime_preview and self.is_playing and not self.is_paused and self.preview_dirty):
+            return
+        now = time.time()
+        if now - self.last_realtime_refresh < self.realtime_refresh_interval:
+            return
+        cursor = self.current_position_seconds()
+        self.render_current()
+        self.play(cursor=cursor, force_render=False)
+        self.last_realtime_refresh = now
+        self.status = f"live-applied @ {format_transport_time(cursor)}"
+
+    def change_bpm(self, delta: int):
+        old_step = max(1e-6, step_duration_seconds(self.patch))
+        old_pos = self.current_position_seconds()
+        old_frac_step = old_pos / old_step
+        old_bpm = int(self.patch.get("bpm", DEFAULT_BPM))
+        new_bpm = int(clamp(old_bpm + int(delta), 40, 260))
+        if new_bpm == old_bpm:
+            return
+        self.patch["bpm"] = new_bpm
+        new_pos = clamp(old_frac_step * step_duration_seconds(self.patch), 0.0, pattern_duration_seconds(self.patch))
+        self.transport_cursor_seconds = new_pos
+        # While playing, update the timebase immediately so the playhead stays on
+        # the same musical step/fraction under the new tempo. The audio buffer is
+        # re-rendered/restarted by apply_live_changes_if_needed() on the next tick.
+        if self.is_playing:
+            now = time.time()
+            self.play_cursor_offset = new_pos
+            self.play_started_at = now
+            self.pause_total = 0.0
+            if self.is_paused:
+                self.pause_started_at = now
+        self.preview_dirty = True
+        self.status = f"tempo {new_bpm} BPM"
 
     def export_wav(self, target_asset: Optional[str] = None, install: bool = False):
         if self.preview_dirty or self.last_render is None:
@@ -986,14 +1072,17 @@ class AudioLabApp:
         self.preview_dirty = True
 
     def current_position_seconds(self) -> float:
+        dur = pattern_duration_seconds(self.patch)
         if not self.is_playing:
-            return clamp(float(self.transport_cursor_seconds), 0.0, pattern_duration_seconds(self.patch))
+            return clamp(float(self.transport_cursor_seconds), 0.0, dur)
         now = self.pause_started_at if self.is_paused else time.time()
         elapsed = max(0.0, now - self.play_started_at - self.pause_total)
-        dur = pattern_duration_seconds(self.patch)
+        pos = self.play_cursor_offset + elapsed
         if self.loop_playback and dur > 1e-9:
-            elapsed = elapsed % dur
-        return elapsed
+            pos = pos % dur
+        else:
+            pos = clamp(pos, 0.0, dur)
+        return pos
 
     def current_step(self):
         pos = self.current_position_seconds()
@@ -1032,6 +1121,14 @@ class AudioLabApp:
             self.buttons[key] = pygame.Rect(x, top, width, transport_btn_h)
             x += width + icon_gap
 
+        # Tempo belongs in the transport, not buried at the bottom. The counter is
+        # clickable; the small stacked arrows are dedicated fine adjust buttons.
+        x += 8
+        self.buttons["bpm_display"] = pygame.Rect(x, top, 88, transport_btn_h)
+        self.buttons["bpm_up"] = pygame.Rect(x + 92, top, 24, transport_btn_h // 2 - 1)
+        self.buttons["bpm_down"] = pygame.Rect(x + 92, top + transport_btn_h // 2 + 1, 24, transport_btn_h // 2 - 1)
+        x += 122
+
         # File buttons stay on the top row; edit/random actions go on row two.
         file_widths = [("save", 66), ("saveas", 78), ("load", 66), ("export", 96)]
         file_total = sum(w for _k, w in file_widths) + gap * (len(file_widths) - 1)
@@ -1054,7 +1151,13 @@ class AudioLabApp:
             self.buttons[f"mute_{i}"] = pygame.Rect(625 + i * 48, track_top, 42, 30)
             self.buttons[f"solo_{i}"] = pygame.Rect(820 + i * 48, track_top, 42, 30)
 
-        param_x = 850
+        # Keep the right synth inspector in its own lane. This fixes the old fixed
+        # x=850 spill where the inspector/status text could draw on top of the
+        # piano roll or title when the window was resized.
+        right_panel_w = 430
+        param_x = max(570, WINDOW_W - right_panel_w)
+        self.param_x = param_x
+        self.param_rect = pygame.Rect(param_x - 10, 104, WINDOW_W - param_x + 10, WINDOW_H - 104)
         param_y = 164
         self.sliders = {}
         p = self.current_params()
@@ -1073,7 +1176,7 @@ class AudioLabApp:
             ("drive", 0.0, 1.0, 0.01),
         ]
         for i, (name, lo, hi, step) in enumerate(slider_defs):
-            rect = pygame.Rect(param_x + 90, param_y + i * 38 + 6, WINDOW_W - param_x - 118, 13)
+            rect = pygame.Rect(param_x + 90, param_y + i * 38 + 6, max(180, WINDOW_W - param_x - 118), 13)
             self.sliders[name] = Slider(name, rect, lo, hi, float(p.get(name, 0.0)), step)
 
         grid_left = 70
@@ -1089,10 +1192,8 @@ class AudioLabApp:
         self.buttons["len_plus"] = pygame.Rect(110, bottom_y, 34, 26)
         self.buttons["vel_minus"] = pygame.Rect(210, bottom_y, 34, 26)
         self.buttons["vel_plus"] = pygame.Rect(250, bottom_y, 34, 26)
-        self.buttons["bpm_minus"] = pygame.Rect(355, bottom_y, 34, 26)
-        self.buttons["bpm_plus"] = pygame.Rect(395, bottom_y, 34, 26)
-        self.buttons["base_down"] = pygame.Rect(500, bottom_y, 34, 26)
-        self.buttons["base_up"] = pygame.Rect(540, bottom_y, 34, 26)
+        self.buttons["base_down"] = pygame.Rect(355, bottom_y, 34, 26)
+        self.buttons["base_up"] = pygame.Rect(395, bottom_y, 34, 26)
 
     def note_at_mouse(self, pos) -> Optional[Tuple[int, int]]:
         if not self.grid_rect.collidepoint(pos):
@@ -1101,8 +1202,9 @@ class AudioLabApp:
         step = int((x - self.grid_rect.x) / max(1e-6, self.step_w))
         row = int((y - self.grid_rect.y) / max(1e-6, self.row_h))
         step = int(clamp(step, 0, int(self.patch.get("steps", STEPS)) - 1))
-        midi = int(self.patch.get("base_midi", BASE_MIDI)) + (ROWS - 1 - row)
-        midi = int(clamp(midi, self.patch.get("base_midi", BASE_MIDI), self.patch.get("base_midi", BASE_MIDI) + ROWS - 1))
+        rows = int(self.patch.get("rows", ROWS))
+        midi = int(self.patch.get("base_midi", BASE_MIDI)) + (rows - 1 - row)
+        midi = int(clamp(midi, self.patch.get("base_midi", BASE_MIDI), self.patch.get("base_midi", BASE_MIDI) + rows - 1))
         return step, midi
 
     def toggle_note(self, step: int, midi: int, erase: bool = False):
@@ -1170,10 +1272,12 @@ class AudioLabApp:
             self.selected_velocity = round(clamp(self.selected_velocity - 0.05, 0.05, 1.0), 2)
         elif key == "vel_plus":
             self.selected_velocity = round(clamp(self.selected_velocity + 0.05, 0.05, 1.0), 2)
-        elif key == "bpm_minus":
-            self.patch["bpm"] = int(clamp(int(self.patch.get("bpm", DEFAULT_BPM)) - 5, 40, 260)); self.preview_dirty = True
-        elif key == "bpm_plus":
-            self.patch["bpm"] = int(clamp(int(self.patch.get("bpm", DEFAULT_BPM)) + 5, 40, 260)); self.preview_dirty = True
+        elif key == "bpm_down":
+            self.change_bpm(-1)
+        elif key == "bpm_up":
+            self.change_bpm(1)
+        elif key == "bpm_display":
+            self.change_bpm(1)
         elif key == "base_down":
             self.patch["base_midi"] = int(clamp(int(self.patch.get("base_midi", BASE_MIDI)) - 12, 12, 84)); self.preview_dirty = True
         elif key == "base_up":
@@ -1227,15 +1331,24 @@ class AudioLabApp:
         elif key == pygame.K_EQUALS:
             self.selected_note_len = int(clamp(self.selected_note_len + 1, 1, 16))
         elif key == pygame.K_COMMA:
-            self.patch["bpm"] = int(clamp(int(self.patch.get("bpm", DEFAULT_BPM)) - 5, 40, 260)); self.preview_dirty = True
+            self.change_bpm(-5 if shift else -1)
         elif key == pygame.K_PERIOD:
-            self.patch["bpm"] = int(clamp(int(self.patch.get("bpm", DEFAULT_BPM)) + 5, 40, 260)); self.preview_dirty = True
+            self.change_bpm(5 if shift else 1)
 
     def handle_mouse_down(self, event):
         pos = event.pos
+        mods = pygame.key.get_mods()
+        bpm_step = 5 if (mods & pygame.KMOD_SHIFT) else 1
         for key, rect in self.buttons.items():
             if rect.collidepoint(pos):
-                self.handle_button(key)
+                if key == "bpm_display":
+                    self.change_bpm(-bpm_step if event.button == 3 else bpm_step)
+                elif key == "bpm_up":
+                    self.change_bpm(bpm_step)
+                elif key == "bpm_down":
+                    self.change_bpm(-bpm_step)
+                else:
+                    self.handle_button(key)
                 return
         for name, slider in self.sliders.items():
             if slider.rect.inflate(0, 12).collidepoint(pos):
@@ -1263,6 +1376,12 @@ class AudioLabApp:
                 self.resize(event.size)
             elif event.type == pygame.KEYDOWN:
                 self.handle_keydown(event)
+            elif event.type == pygame.MOUSEWHEEL:
+                pos = pygame.mouse.get_pos()
+                bpm_rects = [self.buttons.get(k) for k in ("bpm_display", "bpm_up", "bpm_down")]
+                if any(r and r.collidepoint(pos) for r in bpm_rects):
+                    step = 5 if (pygame.key.get_mods() & pygame.KMOD_SHIFT) else 1
+                    self.change_bpm(int(event.y) * step)
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 self.handle_mouse_down(event)
             elif event.type == pygame.MOUSEMOTION:
@@ -1270,10 +1389,32 @@ class AudioLabApp:
             elif event.type == pygame.MOUSEBUTTONUP:
                 self.handle_mouse_up(event)
 
+
+    def draw_bpm_widget(self):
+        display = self.buttons.get("bpm_display")
+        up = self.buttons.get("bpm_up")
+        down = self.buttons.get("bpm_down")
+        if not display or not up or not down:
+            return
+        bpm = int(self.patch.get("bpm", DEFAULT_BPM))
+        pygame.draw.rect(self.screen, (12, 22, 25), display, border_radius=6)
+        pygame.draw.rect(self.screen, (92, 145, 152), display, width=1, border_radius=6)
+        txt = self.font.render(f"{bpm:03d} BPM", True, (226, 246, 242))
+        self.screen.blit(txt, (display.centerx - txt.get_width() // 2, display.centery - txt.get_height() // 2))
+        for rect, direction in ((up, 1), (down, -1)):
+            pygame.draw.rect(self.screen, (34, 52, 56), rect, border_radius=4)
+            pygame.draw.rect(self.screen, (82, 132, 138), rect, width=1, border_radius=4)
+            if direction > 0:
+                pts = [(rect.centerx, rect.y + 4), (rect.x + 6, rect.bottom - 5), (rect.right - 6, rect.bottom - 5)]
+            else:
+                pts = [(rect.centerx, rect.bottom - 4), (rect.x + 6, rect.y + 5), (rect.right - 6, rect.y + 5)]
+            pygame.draw.polygon(self.screen, (210, 242, 236), pts)
+
     def draw_transport(self):
         keys = [
             "transport_pause", "transport_play", "transport_stop", "transport_home",
             "transport_end", "transport_rec", "transport_render", "transport_loop",
+            "bpm_display", "bpm_up", "bpm_down",
         ]
         rects = [self.buttons[k] for k in keys if k in self.buttons]
         if not rects:
@@ -1294,7 +1435,7 @@ class AudioLabApp:
             "transport_render": "render",
             "transport_loop": "loop",
         }
-        for key in keys:
+        for key in [k for k in keys if k.startswith("transport_")]:
             rect = self.buttons.get(key)
             if not rect:
                 continue
@@ -1307,6 +1448,8 @@ class AudioLabApp:
                 ),
                 disabled=(key == "transport_rec"),
             )
+
+        self.draw_bpm_widget()
 
         dur = pattern_duration_seconds(self.patch)
         pos = self.current_position_seconds()
@@ -1332,7 +1475,7 @@ class AudioLabApp:
         for key, rect in self.buttons.items():
             if (key.startswith("transport_") or key.startswith("track_") or key.startswith("mute_") or
                     key.startswith("solo_") or key in ("len_minus", "len_plus", "vel_minus", "vel_plus",
-                    "bpm_minus", "bpm_plus", "base_down", "base_up")):
+                    "bpm_display", "bpm_up", "bpm_down", "base_down", "base_up")):
                 continue
             label = {
                 "save": "SAVE", "saveas": "SAVE AS", "load": "LOAD", "export": "EXPORT WAV",
@@ -1348,7 +1491,10 @@ class AudioLabApp:
         dirty = "*" if self.preview_dirty else ""
         transport = f"{format_transport_time(self.current_position_seconds())}/{format_transport_time(pattern_duration_seconds(self.patch))}"
         text = self.small.render(f"patch: {patch_name}{dirty}   file: {pfile}   transport: {transport}   status: {self.status}", True, (180, 215, 218))
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(pygame.Rect(250, 110, max(20, self.param_rect.x - 260), 26))
         self.screen.blit(text, (250, 116))
+        self.screen.set_clip(old_clip)
 
     def draw_tracks(self):
         for i in range(TRACKS):
@@ -1427,10 +1573,12 @@ class AudioLabApp:
                 pygame.draw.rect(self.screen, border, rect, width=1, border_radius=3)
 
     def draw_params(self):
-        x = 850
+        x = self.param_x
         y = 114
         tr = self.patch["tracks"][self.selected_track]
         params = tr["params"]
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(self.param_rect.inflate(-4, -4))
         title = self.big.render(f"TRACK {self.selected_track+1} SYNTH", True, (235, 255, 255))
         self.screen.blit(title, (x, y))
         wave = params.get("wave", "sine")
@@ -1450,17 +1598,19 @@ class AudioLabApp:
 
         help_lines = [
             "mouse L: toggle note   mouse R: erase note",
-            "transport icons: pause play stop skip-start skip-end rec* render loop",
+            "BPM: click counter / arrows / wheel; shift = x5",
             "space play   enter render   ctrl+s save   ctrl+e export",
-            "1-4 select track   tab next track   [/] waveform",
-            "R random sound   P random notes   arrows transpose",
-            "JSON patches: tools/audio_lab_patches/",
-            "WAV exports:   tools/audio_lab_exports/",
+            "1-4 track   tab next   [/] waveform   R/P randomize",
+            "JSON: tools/audio_lab_patches/",
+            "WAV:  tools/audio_lab_exports/",
         ]
-        hy = WINDOW_H - 235
-        for line in help_lines:
+        slider_bottom = max((sl.rect.bottom for sl in self.sliders.values()), default=y + 60)
+        hy = slider_bottom + 18
+        max_lines = max(0, (WINDOW_H - hy - 16) // 18)
+        for line in help_lines[:max_lines]:
             s = self.small.render(line, True, (150, 185, 185))
-            self.screen.blit(s, (x, hy)); hy += 20
+            self.screen.blit(s, (x, hy)); hy += 18
+        self.screen.set_clip(old_clip)
 
     def draw_bottom(self):
         y = WINDOW_H - 112
@@ -1468,16 +1618,13 @@ class AudioLabApp:
         draw_button(self.screen, self.buttons["len_plus"], "+", self.small)
         draw_button(self.screen, self.buttons["vel_minus"], "-", self.small)
         draw_button(self.screen, self.buttons["vel_plus"], "+", self.small)
-        draw_button(self.screen, self.buttons["bpm_minus"], "-", self.small)
-        draw_button(self.screen, self.buttons["bpm_plus"], "+", self.small)
         draw_button(self.screen, self.buttons["base_down"], "-", self.small)
         draw_button(self.screen, self.buttons["base_up"], "+", self.small)
         items = [
             (12, f"note len: {self.selected_note_len} step(s)"),
             (160, f"velocity: {self.selected_velocity:.2f}"),
-            (300, f"BPM: {self.patch.get('bpm', DEFAULT_BPM)}"),
-            (450, f"base: {note_name(int(self.patch.get('base_midi', BASE_MIDI)))}"),
-            (620, f"selected track notes: {len(self.patch['tracks'][self.selected_track].get('notes', []))}"),
+            (300, f"base: {note_name(int(self.patch.get('base_midi', BASE_MIDI)))}"),
+            (470, f"selected track notes: {len(self.patch['tracks'][self.selected_track].get('notes', []))}"),
         ]
         for x, txt in items:
             s = self.font.render(txt, True, (195, 225, 225))
@@ -1515,9 +1662,11 @@ class AudioLabApp:
     def draw(self):
         self.layout()
         self.screen.fill((3, 5, 7))
-        # Background scan-ish panels.
+        # Background scan-ish panels. The right inspector gets a real panel and
+        # clipping lane so its text never paints over the piano roll/status area.
         pygame.draw.rect(self.screen, (7, 13, 16), (0, 0, WINDOW_W, 132))
-        pygame.draw.rect(self.screen, (7, 13, 16), (835, 104, WINDOW_W - 835, WINDOW_H - 104))
+        pygame.draw.rect(self.screen, (7, 13, 16), self.param_rect)
+        pygame.draw.line(self.screen, (45, 82, 88), (self.param_rect.x, self.param_rect.y), (self.param_rect.x, WINDOW_H), 1)
         self.draw_top()
         self.draw_tracks()
         self.draw_grid()
@@ -1529,6 +1678,7 @@ class AudioLabApp:
     def run(self):
         while True:
             self.handle_events()
+            self.apply_live_changes_if_needed()
             self.draw()
             self.clock.tick(FPS)
 
