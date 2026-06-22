@@ -16,7 +16,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.50-first-run-asset-notice"
+version_number = "0.15.51-reset-confirm"
 
 import colorsys
 import json
@@ -1081,7 +1081,7 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
 
     lines = [
         (small.render("A/D or ←/→: move X    W/S or ↑/↓: move Y", True, (210, 235, 240)), 12),
-        (small.render("Q/E: move Z    Hold Shift for rush    Ctrl+R = reset run    M = mute", True, (210, 235, 240)), 38),
+        (small.render("Q/E: move Z    Hold Shift for rush    Ctrl+R = reset options    M = mute", True, (210, 235, 240)), 38),
         (tiny.render("Alt+F / F11 / Alt+Enter = fullscreen    H = help overlay", True, (178, 222, 230)), 66),
         (stat.render(f"Score: {score}     Best escape: {best_escape}/{MAX_CELLS} cubes     Highest level: {highest_level}", True, (165, 205, 218)), 89),
     ]
@@ -1171,6 +1171,48 @@ def render_quit_confirm(t: float):
     draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2 + 150)
 
 
+def render_reset_confirm(t: float, current_level: int, score: int):
+    """Ctrl+R confirmation overlay.
+
+    Reset is destructive enough that it should never instantly throw a level-6
+    run back to level 1. Ask whether the player wants a full run reset, a
+    current-level restart, or cancellation.
+    """
+    pulse = 0.55 + 0.45 * math.sin(t * 5.8)
+    panel = pygame.Surface((780, 250), pygame.SRCALPHA)
+    pygame.draw.rect(panel, (0, 0, 0, 224), panel.get_rect(), border_radius=18)
+    pygame.draw.rect(panel, (255, 230, 95, 135 + int(90 * pulse)), panel.get_rect(), width=3, border_radius=18)
+
+    title = get_font(38, True)
+    body = get_font(21, False)
+    key_font = get_font(23, True)
+    tiny = get_font(15, False)
+
+    title_s = title.render("RESET CONFIRMATION", True, (255, 235, 145))
+    panel.blit(title_s, ((panel.get_width() - title_s.get_width()) // 2, 22))
+
+    warn = body.render("Choose what gets rebuilt. Nothing happens until you choose.", True, (220, 240, 240))
+    panel.blit(warn, ((panel.get_width() - warn.get_width()) // 2, 72))
+
+    options = [
+        ("1", "reset whole run to LEVEL 1", (255, 190, 145)),
+        ("2", f"restart current LEVEL {current_level}", (175, 255, 205)),
+        ("Esc / N", "cancel and continue", (200, 225, 235)),
+    ]
+    y = 112
+    for key, text, color in options:
+        k = key_font.render(key, True, color)
+        body_s = body.render(text, True, (220, 235, 238))
+        x = 110
+        panel.blit(k, (x, y))
+        panel.blit(body_s, (x + 112, y + 2))
+        y += 38
+
+    footer = tiny.render(f"Current score: {score}   ·   Ctrl+R opened this screen", True, (155, 190, 198))
+    panel.blit(footer, ((panel.get_width() - footer.get_width()) // 2, panel.get_height() - 30))
+    draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2 + 90)
+
+
 def render_help_overlay(t: float, game_state: str, level: int):
     """Toggleable control/help overlay, drawn on top of the current scene."""
     overlay = pygame.Surface((DISPLAY[0], DISPLAY[1]), pygame.SRCALPHA)
@@ -1207,7 +1249,7 @@ def render_help_overlay(t: float, game_state: str, level: int):
         (body, "Esc                   title screen / quit confirm", (210, 235, 240), 376),
         (body, "Alt+F, F11, Alt+Enter fullscreen / windowed", (210, 235, 240), 400),
         (body, "M                     mute / unmute", (210, 235, 240), 424),
-        (body, "Ctrl+R                reset run", (210, 235, 240), 448),
+        (body, "Ctrl+R                reset options", (210, 235, 240), 448),
     ]
     for font, text, color, y in rows:
         s = font.render(text, True, color)
@@ -5671,6 +5713,8 @@ def main():
     show_help_overlay = False
     paused = False
     pause_ui_t = 0.0
+    reset_confirm_active = False
+    reset_confirm_previous_paused = False
     locate_camera_enabled = AUTO_CENTER_ON_PLAYER
     timed_mode_intro_seen = False
     time_intro_timer = 0.0
@@ -5820,6 +5864,60 @@ def main():
         course_materialize_timer = 0.0
         begin_level_ready(1, f"{label}: LEVEL 1")
 
+    def restart_current_level(label="RESET CURRENT LEVEL"):
+        """Restart the current level attempt without wiping run score/progress.
+
+        Full run reset is handled by start_new_run(). This path is for the
+        confirmation screen option that keeps the player on the same level,
+        which matters once a run has reached deeper levels.
+        """
+        nonlocal next_level_to_start, last_escape_count, win_overlay_timer, portal_warp_timer, death_timer, course_materialize_timer
+        nonlocal time_intro_timer, timed_leg_timer, timed_current_module
+        target = max(1, int(current_level))
+        next_level_to_start = max(next_level_to_start, target)
+        last_escape_count = 0
+        win_overlay_timer = 0.0
+        portal_warp_timer = 0.0
+        death_timer = 0.0
+        course_materialize_timer = 0.0
+        time_intro_timer = 0.0
+        timed_leg_timer = TIME_PER_LEG_SECONDS
+        timed_current_module = 0
+        begin_level_ready(target, f"{label}: LEVEL {target}")
+
+    def open_reset_confirm():
+        nonlocal reset_confirm_active, reset_confirm_previous_paused, paused, show_help_overlay
+        if reset_confirm_active:
+            return
+        reset_confirm_active = True
+        reset_confirm_previous_paused = paused
+        paused = True
+        show_help_overlay = False
+        audio_pause_all()
+        set_message("RESET? 1 LEVEL ONE / 2 CURRENT / ESC CANCEL", 1.2)
+
+    def cancel_reset_confirm():
+        nonlocal reset_confirm_active, paused
+        reset_confirm_active = False
+        paused = reset_confirm_previous_paused
+        if not paused:
+            audio_resume_all()
+        set_message("RESET CANCELLED", 0.8)
+
+    def confirm_reset_to_level_one():
+        nonlocal reset_confirm_active, paused
+        reset_confirm_active = False
+        paused = False
+        audio_resume_all()
+        start_new_run("RESET RUN")
+
+    def confirm_reset_current_level():
+        nonlocal reset_confirm_active, paused
+        reset_confirm_active = False
+        paused = False
+        audio_resume_all()
+        restart_current_level("RESET CURRENT LEVEL")
+
     def begin_time_intro(target_level: int):
         nonlocal game_state, time_intro_timer, current_level, next_level_to_start, damage_timer, paused
         paused = False
@@ -5846,6 +5944,9 @@ def main():
 
     def return_to_title():
         nonlocal game_state, death_timer, portal_warp_timer, win_overlay_timer, damage_timer, reassembly_particles, level_ready_timer, course_materialize_timer, recoupling_particles, recoupling_timer, recoupling_notice_timer, paused
+        nonlocal reset_confirm_active, reset_confirm_previous_paused
+        reset_confirm_active = False
+        reset_confirm_previous_paused = False
         paused = False
         audio_resume_all()
         reassembly_particles = []
@@ -5903,6 +6004,17 @@ def main():
                     set_message("FULLSCREEN" if fs else "WINDOWED", 0.9)
                     continue
 
+                if reset_confirm_active:
+                    if event.key in (pygame.K_1, pygame.K_KP1):
+                        confirm_reset_to_level_one()
+                    elif event.key in (pygame.K_2, pygame.K_KP2):
+                        confirm_reset_current_level()
+                    elif event.key in (pygame.K_n, pygame.K_ESCAPE):
+                        cancel_reset_confirm()
+                    else:
+                        set_message("RESET? 1 LEVEL ONE / 2 CURRENT / ESC CANCEL", 0.95)
+                    continue
+
                 if event.key == pygame.K_l:
                     locate_camera_enabled = not locate_camera_enabled
                     set_message("LOCATE CAMERA ON" if locate_camera_enabled else "LOCATE CAMERA OFF", 0.85)
@@ -5933,6 +6045,7 @@ def main():
                     muted = audio_toggle_mute()
                     set_message("AUDIO MUTED" if muted else "AUDIO ON", 0.8)
                     continue
+
 
                 if game_state == "quit_confirm":
                     if event.key == pygame.K_y:
@@ -6007,16 +6120,20 @@ def main():
                         set_message("RE-COUPLING UNAVAILABLE", 0.55)
 
                 elif event.key == pygame.K_r:
-                    # Keep R as an explicit full-run reset/debug key, but do not let
-                    # an accidental R tap during active play throw a level 6 run back
-                    # to level 1. In active states, Ctrl+R is required.
+                    # Keep R as an explicit reset/debug key, but never let an
+                    # accidental R tap during active play throw a deep run back
+                    # to level 1. During a run, plain R only reminds the player;
+                    # Ctrl+R opens a confirmation with full-run/current-level/cancel.
                     active_run_states = (
                         "level_ready", "time_intro", "course_materialize", "playing",
                         "death_dissolve", "reassembly", "reassembly_flash", "portal_warp",
                     )
                     ctrl_down = bool(mods & pygame.KMOD_CTRL)
-                    if RUN_RESET_REQUIRES_CTRL_DURING_PLAY and game_state in active_run_states and not ctrl_down:
-                        set_message("CTRL+R = RESET RUN", 0.85)
+                    if game_state in active_run_states:
+                        if RUN_RESET_REQUIRES_CTRL_DURING_PLAY and not ctrl_down:
+                            set_message("CTRL+R = RESET OPTIONS", 0.85)
+                        else:
+                            open_reset_confirm()
                     else:
                         start_new_run("RESET RUN")
 
@@ -6277,6 +6394,9 @@ def main():
         if paused:
             render_pause_overlay(pause_ui_t, locate_camera_enabled)
 
+        if reset_confirm_active:
+            render_reset_confirm(pause_ui_t, current_level, score)
+
         if show_help_overlay:
             render_help_overlay(t if not paused else pause_ui_t, game_state, current_level)
 
@@ -6291,7 +6411,7 @@ def main():
             pygame.display.set_caption(
                 f"Cube Libre v.{version_number} | state: {game_state} | level: {current_level} | intact: {player.intact_count():3d}/{MAX_CELLS} | "
                 f"score: {score} | best: {best_escape}/{MAX_CELLS} | highest level: {highest_level} | "
-                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc title/quit confirm | H help | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset{msg}"
+                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc title/quit confirm | H help | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset options{msg}"
             )
             caption_timer = 0.12
 
