@@ -12,16 +12,24 @@ This is still an experimental prototype, not a polished release. Expect weirdnes
 
 ## Current concept
 
+```
+I have no fixed place here.
+I only have my remaining pieces.
+I'm on my way to the portal.
+```
+
 The player starts as a 5×5×5 cube, 125 smaller cubes total. Each surviving cube matters.
 
 Core mechanics currently explored:
 
+- constantly rotating camera that is mostly beyond player control
 - rotating laser-grid obstacle fields
 - modular tunnel / L-joint maze progression
 - cube-body damage, fragmentation, and re-coupling
 - time-limited recoverability of lost cubes
 - lossy re-coupling gather rate
 - portal commitment, requiring the remaining body to enter fully
+- sacrifices to get through the portal, even if with a single cube
 - collapsing maze sections behind the player
 - level-based progression and high-score tracking
 - timed mode from later levels onward
