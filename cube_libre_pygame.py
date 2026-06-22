@@ -4,34 +4,111 @@
 # cube_libre_pygame.py
 # ~~~~~~~~~~~~~~~~~~~~
 #
-# "Cube Libre" - rotating-field fixed prototype
+# "Cube Libre" - rotating-field maze prototype game
 #
 # A cubistic puzzle/adventure game where the player is a cube made of smaller cubes.
+# The player's goal is to get to the portal at the end of the maze with whatever pieces they have.
 # Hits against rotating laser grids chip away the body. Broken chunks become independent
 # debris; intact cells remain part of the controlled body.
 #
 # Original concept/code by FlyingFathead (w/ imaginary digital friends), Dec 2023-Dec 2024
 # This version keeps the rotating playfield / rotating laser-grid concept while fixing the
 # state model, broken delta-time, negative-index topology bug, and collision animation mess.
+# by FlyingFathead, 2026
 #
 # this version: june 22, 2026
 
-version_number = "0.15.51-reset-confirm"
+version_number = "0.15.65-first-run-setup-lower"
 
 import colorsys
+import importlib.util
 import json
 import math
 import os
+import platform as stdlib_platform
 import random
+import shlex
+import shutil
+import subprocess
+import sys
 import threading
 import wave
 from array import array
 from dataclasses import dataclass
 
-import pygame
-from pygame.locals import DOUBLEBUF, OPENGL, RESIZABLE, FULLSCREEN
-from OpenGL.GL import *
-from OpenGL.GLU import *
+# -----------------------------------------------------------------------------
+# Startup preflight: fail early and usefully instead of exploding at first import.
+# -----------------------------------------------------------------------------
+
+_REQUIRED_PYTHON_MODULES = (
+    ("pygame", "pygame"),
+    ("OpenGL", "PyOpenGL"),
+    ("numpy", "numpy"),
+)
+
+
+def _quote_cmd_part(value) -> str:
+    return shlex.quote(str(value))
+
+
+def _requirements_path() -> str:
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, "requirements.txt")
+
+
+def _print_dependency_install_help(missing_packages=None, broken_exception=None):
+    missing_packages = list(dict.fromkeys(missing_packages or []))
+    exe = sys.executable or "python"
+    req = _requirements_path()
+
+    print("[ERROR] Cube Libre cannot start because required Python dependencies are missing or broken.", file=sys.stderr)
+    if missing_packages:
+        print("[ERROR] Missing package(s): " + ", ".join(missing_packages), file=sys.stderr)
+    if broken_exception is not None:
+        print(f"[ERROR] Import failure: {broken_exception.__class__.__name__}: {broken_exception}", file=sys.stderr)
+
+    print("", file=sys.stderr)
+    print("Install the repository requirements with:", file=sys.stderr)
+    if os.path.exists(req):
+        print(f"  {_quote_cmd_part(exe)} -m pip install -r {_quote_cmd_part(req)}", file=sys.stderr)
+    else:
+        print(f"  {_quote_cmd_part(exe)} -m pip install -r requirements.txt", file=sys.stderr)
+        print("  (run this from the Cube Libre repository root)", file=sys.stderr)
+
+    packages = missing_packages or [pip_name for _module_name, pip_name in _REQUIRED_PYTHON_MODULES]
+    print("", file=sys.stderr)
+    print("Or install the Python packages directly:", file=sys.stderr)
+    print(f"  {_quote_cmd_part(exe)} -m pip install " + " ".join(_quote_cmd_part(pkg) for pkg in packages), file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Required packages: pygame, PyOpenGL, numpy", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _preflight_required_python_modules():
+    missing = []
+    for module_name, pip_name in _REQUIRED_PYTHON_MODULES:
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(pip_name)
+    if missing:
+        _print_dependency_install_help(missing_packages=missing)
+
+
+_preflight_required_python_modules()
+
+try:
+    import pygame
+    from pygame.locals import DOUBLEBUF, OPENGL, RESIZABLE, FULLSCREEN
+except Exception as exc:
+    _print_dependency_install_help(missing_packages=["pygame"], broken_exception=exc)
+
+try:
+    from OpenGL.GL import *
+    from OpenGL.GLU import *
+except Exception as exc:
+    _print_dependency_install_help(missing_packages=["PyOpenGL"], broken_exception=exc)
 
 # -----------------------------------------------------------------------------
 # Config
@@ -117,6 +194,11 @@ LEVEL_READY_FADE_IN_SECONDS = 0.95
 AUDIO_ENABLED = True
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_DIR_NAME = "cube_libre_sfx"
+# First-run audio rendering is CPU-heavy pure Python. Keep it out of the
+# Pygame process so Linux/Wayland/GNOME does not think the window has frozen
+# while the WAV cache is being built.
+AUDIO_BUILDER_ARG = "--cube-libre-build-audio-cache-worker"
+AUDIO_BUILDER_NICE = 5
 # On first run, the procedural audio WAVs may take a while to synthesize,
 # especially on Windows. Keep the title screen alive, show a clear setup
 # notice, and do not allow starting the run until the missing audio cache has
@@ -261,6 +343,15 @@ TIME_BUZZER_START_SECONDS = 10.0
 TIME_SIREN_START_SECONDS = 5.0
 TIME_BUZZER_COOLDOWN_SECONDS = 0.82
 
+# Audio mix tuning. Keep runtime mixer gain separate from source-file gain.
+# The alien-gamelan WAV is deliberately generated/copied from the safe old synth
+# and then raised as a source asset with a peak ceiling, instead of rewriting the
+# instrument into a clipped/distorted mess.
+GAMELAN_GAIN_DB = 0.0
+GAMELAN_GAIN = 10.0 ** (GAMELAN_GAIN_DB / 20.0)
+GAMELAN_SOURCE_GAIN_DB = 12.0
+GAMELAN_SOURCE_GAIN = 10.0 ** (GAMELAN_SOURCE_GAIN_DB / 20.0)
+GAMELAN_SOURCE_TARGET_PEAK = 0.86
 
 
 # -----------------------------------------------------------------------------
@@ -482,6 +573,165 @@ def get_font(size: int, bold: bool = False):
             font = pygame.font.Font(None, size)
         _font_cache[key] = font
     return font
+
+
+# -----------------------------------------------------------------------------
+# Optional Cube Libre dot-matrix font.
+# -----------------------------------------------------------------------------
+# The game should be able to use the procedural dot font when the companion files
+# are present, but never fail to boot because one asset/editor file was not copied.
+# Missing/broken dotmatrix support prints one warning and falls back to get_font().
+
+DOTMATRIX_FONT_FILE = os.path.join("assets", "fonts", "cube_libre_5x7.json")
+DOTMATRIX_EDITOR_FILE = "dotmatrix_font_editor.py"
+DOTMATRIX_REQUIRED_CHARS = "".join(dict.fromkeys("SPACE / ENTER = NEW RUNRENDERING AUDIO ASSETS - PLEASE WAITAUDIO DISABLEDÅÄÖÜåäöü?".replace(" ", "")))
+
+_dotmatrix_font = None
+_dotmatrix_checked = False
+_dotmatrix_warning_printed = False
+
+
+def _repo_path(*parts) -> str:
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, *parts)
+
+
+def _warn_dotmatrix(message: str):
+    global _dotmatrix_warning_printed
+    if not _dotmatrix_warning_printed:
+        print(f"[WARN] Cube Libre dot-matrix font unavailable: {message}", file=sys.stderr)
+        print("[WARN] Falling back to normal pygame UI font for that text.", file=sys.stderr)
+        _dotmatrix_warning_printed = True
+
+
+def get_dotmatrix_font():
+    """Load the optional procedural dot-matrix font once, or return None.
+
+    Runtime files expected in the repository root/layout:
+      - dotmatrix_font.py
+      - assets/fonts/cube_libre_5x7.json
+
+    The standalone editor is also checked so local builds warn if the generator
+    utility was not copied, but the editor is not required for gameplay.
+    """
+    global _dotmatrix_font, _dotmatrix_checked
+    if _dotmatrix_checked:
+        return _dotmatrix_font
+    _dotmatrix_checked = True
+
+    try:
+        from dotmatrix_font import DotMatrixFont
+    except Exception as exc:
+        _warn_dotmatrix(f"could not import dotmatrix_font.py ({exc.__class__.__name__}: {exc})")
+        return None
+
+    editor_path = _repo_path(DOTMATRIX_EDITOR_FILE)
+    if not os.path.exists(editor_path):
+        print(f"[WARN] Dot-matrix editor/generator not found at {editor_path}; gameplay can continue.", file=sys.stderr)
+
+    font_path = _repo_path(DOTMATRIX_FONT_FILE)
+    try:
+        if os.path.exists(font_path):
+            font = DotMatrixFont.load(font_path)
+        else:
+            print(f"[WARN] Dot-matrix JSON font not found at {font_path}; using built-in starter glyphs.", file=sys.stderr)
+            font = DotMatrixFont.from_builtin()
+
+        missing = []
+        for ch in DOTMATRIX_REQUIRED_CHARS:
+            glyph = font.get_glyph(ch)
+            if not glyph or not any("1" in row for row in glyph):
+                missing.append(ch)
+        if missing:
+            raise RuntimeError("missing/blank glyphs: " + "".join(dict.fromkeys(missing)))
+
+        _dotmatrix_font = font
+        return _dotmatrix_font
+    except Exception as exc:
+        _warn_dotmatrix(f"could not load/use {font_path} ({exc.__class__.__name__}: {exc})")
+        _dotmatrix_font = None
+        return None
+
+
+def make_dotmatrix_title_prompt(label: str, t: float, color) -> object:
+    """Return a transparent pygame Surface for the title start prompt, or None.
+
+    Long setup/failure notices are allowed to fall back to the normal pygame font
+    if the dot-matrix version would need to become unreadably tiny.
+    """
+    font = get_dotmatrix_font()
+    if font is None:
+        return None
+
+    label = str(label)
+    # First config is the intended look for "SPACE / ENTER = NEW RUN".
+    # This must be actually smaller than the old pygame prompt: reduce dot_size
+    # from 4 to 3. Merely tightening the gap did not visibly change enough.
+    # Smaller fallbacks are kept for long first-run audio setup notices.
+    configs = (
+        (3, 1, 2),
+        (3, 1, 1),
+        (2, 1, 1),
+    )
+    chosen = None
+    for dot_size, gap, char_spacing in configs:
+        w, h = font.measure(label, dot_size=dot_size, gap=gap, char_spacing=char_spacing, line_spacing=dot_size * 2)
+        if w <= 742 and h <= 58:
+            chosen = (dot_size, gap, char_spacing, w, h)
+            break
+    if chosen is None:
+        return None
+
+    dot_size, gap, char_spacing, _w, _h = chosen
+    surf = pygame.Surface((760, 70), pygame.SRCALPHA)
+    cx, cy = surf.get_width() // 2, surf.get_height() // 2
+    r, g, b = [int(v) for v in color[:3]]
+
+    # Cheap glow: draw the dot glyphs a few times with alpha before the main pass.
+    # Keep the glow slightly tighter too, otherwise the smaller prompt still
+    # looks bloated because of the halo.
+    for ox, oy, alpha in ((-1, 0, 32), (1, 0, 32), (0, -1, 32), (0, 1, 32), (0, 0, 56)):
+        font.draw(
+            surf, label, (cx + ox, cy + oy),
+            dot_size=dot_size, gap=gap, char_spacing=char_spacing,
+            color=(r, g, b, alpha), align="center", valign="middle",
+            dot_shape="square", blink_phase=t, blink_rate=5.2, blink_depth=0.18,
+        )
+
+    font.draw(
+        surf, label, (cx + 1, cy + 1),
+        dot_size=dot_size, gap=gap, char_spacing=char_spacing,
+        color=(0, 0, 0, 165), align="center", valign="middle",
+        dot_shape="square",
+    )
+    font.draw(
+        surf, label, (cx, cy),
+        dot_size=dot_size, gap=gap, char_spacing=char_spacing,
+        color=(r, g, b, 255), align="center", valign="middle",
+        dot_shape="square", border_color=(255, 255, 255, 65),
+        blink_phase=t, blink_rate=5.2, blink_depth=0.10,
+    )
+    return surf
+
+
+def make_fallback_title_prompt(label: str, t: float, color) -> object:
+    """Original pygame-font title prompt, kept as fallback."""
+    prompt = pygame.Surface((760, 70), pygame.SRCALPHA)
+    big = get_font(32, True)
+    tr, tg, tb = [int(v) for v in color[:3]]
+    for ox, oy, alpha in [(-3, 0, 60), (3, 0, 60), (0, -3, 60), (0, 3, 60), (0, 0, 95)]:
+        glow = big.render(label, True, (tr, tg, tb))
+        glow.set_alpha(alpha)
+        prompt.blit(glow, ((prompt.get_width() - glow.get_width()) // 2 + ox, 16 + oy))
+    shadow = big.render(label, True, (0, 0, 0))
+    shadow.set_alpha(165)
+    prompt.blit(shadow, ((prompt.get_width() - shadow.get_width()) // 2 + 2, 18))
+    text_surf = big.render(label, True, (tr, tg, tb))
+    prompt.blit(text_surf, ((prompt.get_width() - text_surf.get_width()) // 2, 16))
+    return prompt
 
 
 def make_text_panel(lines, title=None, footer=None, width=720):
@@ -1048,8 +1298,8 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
     pulse = 0.55 + 0.45 * math.sin(t * 4.0)
 
     # Floating start prompt: no rectangle, just glow/shadow text over the stars.
-    prompt = pygame.Surface((760, 70), pygame.SRCALPHA)
-    big = get_font(32, True)
+    # Prefer the Cube Libre procedural dot-matrix font. If its module/JSON is
+    # missing or broken, print a warning and keep the old pygame-font prompt.
     tr, tg, tb = [int(v * 255) for v in _hsv(t * 0.10, 0.55, 1.0)]
     if audio_start_blocked():
         label = "RENDERING AUDIO ASSETS - PLEASE WAIT"
@@ -1057,17 +1307,16 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
         label = "AUDIO DISABLED - SPACE / ENTER = NEW RUN"
     else:
         label = "SPACE / ENTER = NEW RUN"
-    # Soft cheap glow by drawing the same text a few times with low alpha.
-    for ox, oy, alpha in [(-3, 0, 60), (3, 0, 60), (0, -3, 60), (0, 3, 60), (0, 0, 95)]:
-        glow = big.render(label, True, (tr, tg, tb))
-        glow.set_alpha(alpha)
-        prompt.blit(glow, ((prompt.get_width() - glow.get_width()) // 2 + ox, 16 + oy))
-    shadow = big.render(label, True, (0, 0, 0))
-    shadow.set_alpha(165)
-    prompt.blit(shadow, ((prompt.get_width() - shadow.get_width()) // 2 + 2, 18))
-    text_surf = big.render(label, True, (tr, tg, tb))
-    prompt.blit(text_surf, ((prompt.get_width() - text_surf.get_width()) // 2, 16))
+    prompt = make_dotmatrix_title_prompt(label, t, (tr, tg, tb))
+    if prompt is None:
+        prompt = make_fallback_title_prompt(label, t, (tr, tg, tb))
     draw_surface_2d(prompt, DISPLAY[0] // 2, 54)
+
+    # During first-run procedural audio rendering, keep the title screen quiet:
+    # show the logo, the top rendering prompt, and the dedicated setup overlay only.
+    # The controls/hotkey panel and footer become visible once start is possible.
+    if audio_start_blocked():
+        return
 
     # Compact bottom info panel. Keep it low enough to not cover the title cubes.
     panel_w = min(max(880, DISPLAY[0] - 120), 1020)
@@ -1151,7 +1400,10 @@ def render_audio_setup_overlay(t: float):
     progress = tiny.render(f"audio cache files: {ready}/{total}", True, (165, 205, 212))
     panel.blit(progress, ((panel.get_width() - progress.get_width()) // 2, 158))
 
-    draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2 + 120)
+    # During first-run rendering this replaces the normal bottom controls/footer
+    # band. Keep the panel size unchanged; only move it below the CUBE LIBRE logo.
+    setup_y = DISPLAY[1] - (panel.get_height() // 2) - 14
+    draw_surface_2d(panel, DISPLAY[0] // 2, setup_y)
 
 
 def render_quit_confirm(t: float):
@@ -1284,7 +1536,7 @@ def draw_title_screen(t: float, score: int, best_escape: int, highest_level: int
 
     # Logo, closer than the stars.
     glLoadIdentity()
-    glTranslatef(0.0, -0.5, -23.5)
+    glTranslatef(0.0, -1.15, -23.5)
     draw_title_logo(t)
 
     # A mild psychedelic veil to keep it tied to the portal/star-transcendence vibe.
@@ -4077,6 +4329,8 @@ _audio = {
     "asset_paths": {},
     "asset_error": None,
     "worker": None,
+    "worker_process": None,
+    "worker_mode": None,
     "assets_missing_on_start": False,
     "asset_missing_names": [],
 }
@@ -4094,7 +4348,9 @@ AUDIO_ASSET_FILENAMES = {
     "crash": "crash_collision.wav",
     "structure_alert": "structure_loss_dee_doo.wav",
     "ambient": "spaceship_engine_room_hum_loop.wav",
-    "gamelan": "alien_gamelan_more_frequent_v3.wav",
+    # Source-gained version of the safe v3 alien-gamelan. If the old v3 cache
+    # exists, generation just copies it with gain, instead of re-synthesizing.
+    "gamelan": "alien_gamelan_more_frequent_v3_sourcegain.wav",
     "field": "field_wooom_loop.wav",
     "critical": "critical_beep_loop.wav",
     "portal": "portal_ethereal_entry.wav",
@@ -4110,6 +4366,10 @@ AUDIO_ASSET_FILENAMES = {
     "time_buzzer": "time_buzzer_10sec_berrrrt.wav",
     "time_siren": "time_siren_5sec_wiuwiu_loop.wav",
 }
+
+LEGACY_GAMELAN_ASSET_FILENAMES = (
+    "alien_gamelan_more_frequent_v3.wav",
+)
 
 
 def expected_audio_asset_paths(out_dir: str = None):
@@ -4136,11 +4396,75 @@ def _pcm16(v: float) -> int:
 def _write_wav_mono(path: str, samples, sample_rate: int = AUDIO_SAMPLE_RATE):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     data = array("h", (_pcm16(v) for v in samples))
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(data.tobytes())
+    # Write through a sidecar temp file and atomically rename it into place.
+    # The parent Pygame process polls file existence for progress; this prevents
+    # it from counting or later trying to load a half-written WAV if the builder
+    # is interrupted.
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with wave.open(tmp_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(data.tobytes())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _source_gain_samples(samples, gain: float = 1.0, peak_ceiling: float = 0.86):
+    """Apply source gain without digital clipping.
+
+    This is intentionally boring: multiply the old/safe generated waveform, then
+    pull it down only if it would exceed the configured peak ceiling. No extra
+    partials, no density change, no soft-clipped distortion baked into the asset.
+    """
+    samples = list(samples)
+    if not samples:
+        return samples
+    gain = max(0.0, float(gain))
+    peak_ceiling = clamp(float(peak_ceiling), 0.05, 0.98)
+    peak_after_gain = max(abs(v * gain) for v in samples)
+    if peak_after_gain <= 1e-9:
+        return samples
+    if peak_after_gain > peak_ceiling:
+        gain *= peak_ceiling / peak_after_gain
+    return [clamp(v * gain, -peak_ceiling, peak_ceiling) for v in samples]
+
+
+def _read_wav_mono_float(path: str):
+    """Read a 16-bit mono/stereo WAV as mono float samples for cache post-gain."""
+    with wave.open(path, "rb") as wf:
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
+    if width != 2:
+        raise ValueError(f"unsupported WAV sample width for {path!r}: {width}")
+    pcm = array("h")
+    pcm.frombytes(frames)
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    if channels <= 1:
+        return [v / 32768.0 for v in pcm]
+    out = []
+    for i in range(0, len(pcm) - channels + 1, channels):
+        out.append(sum(pcm[i:i + channels]) / (32768.0 * channels))
+    return out
+
+
+def _write_source_gained_wav(src_path: str, dst_path: str) -> bool:
+    try:
+        samples = _read_wav_mono_float(src_path)
+        _write_wav_mono(dst_path, _source_gain_samples(samples, GAMELAN_SOURCE_GAIN, GAMELAN_SOURCE_TARGET_PEAK))
+        print(f"[INFO] Generated source-gained alien gamelan from existing cache: {dst_path}")
+        return True
+    except Exception as exc:
+        print(f"[WARN] Could not source-gain existing gamelan cache {src_path}: {exc}")
+        return False
 
 
 def _env_adsr(t: float, dur: float, attack: float = 0.01, release: float = 0.08) -> float:
@@ -4242,66 +4566,74 @@ def generate_audio_assets(force: bool = False):
         _write_wav_mono(paths["ambient"], _synth_seconds(dur, f))
 
     if need("gamelan"):
-        # Alien-gamelan / ritual-engine-room tones. Still slow and spacious, but
-        # less sparse again: more struck notes, frequent overlap, same deliberately
-        # crooked pelog/phrygian-ish scale.
-        dur = 48.0
-        rng = random.Random(73092)
-        # Pelog-ish / phrygian-ish uneven scale ratios. The slightly crooked values are
-        # intentional; equal temperament sounded too clean and civilized for this thing.
-        ratios = [1.0, 1.055, 1.128, 1.172, 1.255, 1.394, 1.515, 1.675, 1.782, 1.883, 2.0]
-        roots = [55.0, 61.735, 65.406, 73.416]  # dark A/B/C/D-ish fundamentals
-        events = []
-        cursor = 1.00
-        while cursor < dur - 4.0:
-            root = rng.choice(roots)
-            ratio = rng.choice(ratios)
-            octave = rng.choice([0, 0, 0, 1])
-            f0 = root * ratio * (2.0 ** octave)
-            tail = rng.uniform(3.5, 7.0)
-            amp = rng.uniform(0.17, 0.32)
-            brightness = rng.uniform(0.60, 1.30)
-            events.append((cursor, tail, f0, amp, brightness, rng.uniform(0.0, math.tau)))
-            # More frequent notes: still with breath, but no 15-second empty desert.
-            cursor += rng.uniform(1.15, 3.10)
+        # Alien-gamelan / ritual-engine-room tones. First try to reuse the old
+        # safe v3 cache and simply write a source-gained copy. If the legacy
+        # cache is not there, synthesize the same old-safe material and apply
+        # the same plain source gain. No extra density/brightness/clipped rewrite.
+        legacy_done = False
+        for legacy_name in LEGACY_GAMELAN_ASSET_FILENAMES:
+            legacy_path = os.path.join(out_dir, legacy_name)
+            if os.path.exists(legacy_path):
+                legacy_done = _write_source_gained_wav(legacy_path, paths["gamelan"])
+                if legacy_done:
+                    break
 
-        def f(t, i, sr):
-            sig = 0.0
-            for start, tail, f0, amp, brightness, phase0 in events:
-                local = t - start
-                if local < 0.0 or local > tail:
-                    continue
-                # Gentle strike, long resonant decay, soft release so the loop never chops.
-                attack = min(1.0, local / 0.055)
-                decay = math.exp(-local * (0.20 + 0.035 * brightness))
-                release = 1.0 if local < tail - 1.2 else max(0.0, (tail - local) / 1.2)
-                env = (attack ** 0.45) * decay * release
+        if not legacy_done:
+            dur = 48.0
+            rng = random.Random(73092)
+            # Pelog-ish / phrygian-ish uneven scale ratios. The slightly crooked values are
+            # intentional; equal temperament sounded too clean and civilized for this thing.
+            ratios = [1.0, 1.055, 1.128, 1.172, 1.255, 1.394, 1.515, 1.675, 1.782, 1.883, 2.0]
+            roots = [55.0, 61.735, 65.406, 73.416]  # dark A/B/C/D-ish fundamentals
+            events = []
+            cursor = 1.00
+            while cursor < dur - 4.0:
+                root = rng.choice(roots)
+                ratio = rng.choice(ratios)
+                octave = rng.choice([0, 0, 0, 1])
+                f0 = root * ratio * (2.0 ** octave)
+                tail = rng.uniform(3.5, 7.0)
+                amp = rng.uniform(0.17, 0.32)
+                brightness = rng.uniform(0.60, 1.30)
+                events.append((cursor, tail, f0, amp, brightness, rng.uniform(0.0, math.tau)))
+                cursor += rng.uniform(1.15, 3.10)
 
-                # Slow pitch shimmer, but not enough to turn it into cheesy sci-fi vibrato.
-                drift = 1.0 + 0.0028 * math.sin(math.tau * 0.041 * t + phase0)
-                base = f0 * drift
+            def f(t, i, sr):
+                sig = 0.0
+                for start, tail, f0, amp, brightness, phase0 in events:
+                    local = t - start
+                    if local < 0.0 or local > tail:
+                        continue
+                    attack = min(1.0, local / 0.055)
+                    decay = math.exp(-local * (0.20 + 0.035 * brightness))
+                    release = 1.0 if local < tail - 1.2 else max(0.0, (tail - local) / 1.2)
+                    env = (attack ** 0.45) * decay * release
 
-                # Inharmonic metallic partials, gamelan-adjacent rather than literal sample mimicry.
-                tone = math.sin(math.tau * base * t + phase0) * 0.62
-                tone += math.sin(math.tau * (base * 2.012) * t + phase0 * 0.31) * 0.22 * brightness
-                tone += math.sin(math.tau * (base * 2.713) * t + 1.3) * 0.13 * brightness
-                tone += math.sin(math.tau * (base * 3.917) * t + 2.1) * 0.070 * brightness
-                tone += math.sin(math.tau * (base * 5.431) * t + 0.7) * 0.035 * brightness
+                    drift = 1.0 + 0.0028 * math.sin(math.tau * 0.041 * t + phase0)
+                    base = f0 * drift
 
-                # Tiny attack click: enough to read as struck metal, not enough to become percussion.
-                strike = 0.0
-                if local < 0.22:
-                    strike_env = math.exp(-local * 22.0)
-                    strike = math.sin(math.tau * (base * 8.0 + 270.0) * t) * strike_env * 0.11 * brightness
-                    strike += (audio_rng.random() * 2.0 - 1.0) * strike_env * 0.015
+                    tone = math.sin(math.tau * base * t + phase0) * 0.62
+                    tone += math.sin(math.tau * (base * 2.012) * t + phase0 * 0.31) * 0.22 * brightness
+                    tone += math.sin(math.tau * (base * 2.713) * t + 1.3) * 0.13 * brightness
+                    tone += math.sin(math.tau * (base * 3.917) * t + 2.1) * 0.070 * brightness
+                    tone += math.sin(math.tau * (base * 5.431) * t + 0.7) * 0.035 * brightness
 
-                sig += (tone + strike) * env * amp
+                    strike = 0.0
+                    if local < 0.22:
+                        strike_env = math.exp(-local * 22.0)
+                        strike = math.sin(math.tau * (base * 8.0 + 270.0) * t) * strike_env * 0.11 * brightness
+                        strike += (audio_rng.random() * 2.0 - 1.0) * strike_env * 0.015
 
-            # Very faint shared resonator/room; gives the notes a common supernatural box.
-            room = math.sin(math.tau * 27.5 * t + 0.4 * math.sin(math.tau * 0.03125 * t)) * 0.025
-            room += math.sin(math.tau * 41.25 * t + 1.2) * 0.014
-            return _soft_clip(sig + room) * 0.76
-        _write_wav_mono(paths["gamelan"], _synth_seconds(dur, f))
+                    sig += (tone + strike) * env * amp
+
+                room = math.sin(math.tau * 27.5 * t + 0.4 * math.sin(math.tau * 0.03125 * t)) * 0.025
+                room += math.sin(math.tau * 41.25 * t + 1.2) * 0.014
+                return _soft_clip(sig + room) * 0.76
+
+            _write_wav_mono(
+                paths["gamelan"],
+                _source_gain_samples(_synth_seconds(dur, f), GAMELAN_SOURCE_GAIN, GAMELAN_SOURCE_TARGET_PEAK),
+            )
 
     if need("field"):
         # 8 seconds, four even wooms, loop-safe-ish because all LFOs use whole cycles.
@@ -4567,7 +4899,7 @@ def _set_baseline_sound_volumes(sounds):
     sounds["crash"].set_volume(0.70)
     sounds["structure_alert"].set_volume(0.48)
     sounds["ambient"].set_volume(0.18)
-    sounds["gamelan"].set_volume(0.16)
+    sounds["gamelan"].set_volume(audio_gain_db(0.24, GAMELAN_GAIN_DB))
     sounds["field"].set_volume(0.26)
     sounds["critical"].set_volume(0.46)
     sounds["portal"].set_volume(0.82)
@@ -4604,7 +4936,7 @@ def _reserve_audio_channels():
 
 
 def _audio_asset_worker(force: bool = False):
-    """Background worker: pure-Python WAV synthesis only, no pygame calls here."""
+    """Thread fallback only. Prefer the subprocess builder for first-run cache."""
     try:
         _audio["asset_paths"] = generate_audio_assets(force=force)
         _audio["asset_error"] = None
@@ -4615,11 +4947,80 @@ def _audio_asset_worker(force: bool = False):
         _audio["assets_ready"] = True
 
 
+def _audio_builder_command(force: bool = False):
+    """Command line for the isolated first-run audio cache builder."""
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, AUDIO_BUILDER_ARG]
+    else:
+        cmd = [sys.executable or "python", os.path.abspath(__file__), AUDIO_BUILDER_ARG]
+    if force:
+        cmd.append("--force")
+    return cmd
+
+
+def _start_audio_builder_process(force: bool = False):
+    """Start procedural WAV generation in a separate Python process.
+
+    A thread still contends with the GIL, which can starve the Pygame event loop
+    while long sample-by-sample synth loops run. A process gives the UI its own
+    interpreter and keeps GNOME/Wayland from seeing a dead window.
+    """
+    env = dict(os.environ)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    kwargs = {
+        "cwd": os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "posix" and AUDIO_BUILDER_NICE:
+        nice_value = int(AUDIO_BUILDER_NICE)
+        def _nice_child():
+            try:
+                os.nice(nice_value)
+            except Exception:
+                pass
+        kwargs["preexec_fn"] = _nice_child
+    elif os.name == "nt":
+        flags = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+        if flags:
+            kwargs["creationflags"] = flags
+    return subprocess.Popen(_audio_builder_command(force=force), **kwargs)
+
+
+def _poll_audio_builder_process():
+    """Update _audio when the external cache-builder process exits."""
+    proc = _audio.get("worker_process")
+    if proc is None or _audio.get("assets_ready"):
+        return
+    rc = proc.poll()
+    if rc is None:
+        return
+
+    _audio["worker_process"] = None
+    _audio["worker"] = None
+
+    if rc != 0:
+        _audio["asset_paths"] = {}
+        _audio["asset_error"] = f"audio cache builder exited with status {rc}"
+        _audio["assets_ready"] = True
+        return
+
+    missing = audio_missing_asset_names()
+    if missing:
+        _audio["asset_paths"] = {}
+        _audio["asset_error"] = "audio cache builder finished but assets are still missing: " + ", ".join(missing)
+    else:
+        _audio["asset_paths"] = expected_audio_asset_paths()
+        _audio["asset_error"] = None
+    _audio["assets_ready"] = True
+
+
 def init_audio():
     """Start audio without blocking the first visible title frame.
 
-    The old version generated/loaded every procedural WAV before opening the GL
-    window. That got slow after the long ambient/gamelan loops were added.
+    Missing first-run WAV cache files are generated by a separate Python process,
+    not by a thread. This keeps Pygame responsive while the procedural synth code
+    burns CPU in another interpreter.
     """
     if not AUDIO_ENABLED:
         return
@@ -4634,24 +5035,46 @@ def init_audio():
         _audio["assets_ready"] = False
         _audio["asset_paths"] = {}
         _audio["asset_error"] = None
+        _audio["worker"] = None
+        _audio["worker_process"] = None
+        _audio["worker_mode"] = None
         _audio["assets_missing_on_start"] = bool(missing_names)
         _audio["asset_missing_names"] = missing_names
-        if missing_names:
-            print(f"[INFO] Audio assets not found/generated yet ({len(missing_names)} missing). Rendering procedural audio into: {_audio_dir()}")
-        worker = threading.Thread(target=_audio_asset_worker, kwargs={"force": False}, daemon=True)
-        _audio["worker"] = worker
-        worker.start()
-        print(f"[INFO] Procedural audio generation/loading started in background: {_audio_dir()}")
+
+        if not missing_names:
+            _audio["asset_paths"] = expected_audio_asset_paths()
+            _audio["assets_ready"] = True
+            print(f"[INFO] Using cached procedural audio assets: {_audio_dir()}")
+            return
+
+        print(f"[INFO] Audio assets not found/generated yet ({len(missing_names)} missing). Rendering procedural audio into: {_audio_dir()}")
+        try:
+            proc = _start_audio_builder_process(force=False)
+            _audio["worker_process"] = proc
+            _audio["worker"] = proc
+            _audio["worker_mode"] = "process"
+            print(f"[INFO] Procedural audio cache builder started as subprocess PID {proc.pid}: {_audio_dir()}")
+        except Exception as exc:
+            # Last-resort fallback: still better to have audio than to hard-fail,
+            # but warn loudly because this can make first-run UI janky again.
+            print(f"[WARN] Could not start subprocess audio builder ({exc}); falling back to thread.")
+            worker = threading.Thread(target=_audio_asset_worker, kwargs={"force": False}, daemon=True)
+            _audio["worker"] = worker
+            _audio["worker_mode"] = "thread_fallback"
+            worker.start()
+            print(f"[INFO] Procedural audio generation/loading started in background thread: {_audio_dir()}")
     except Exception as exc:
         _audio["ok"] = False
         _audio["init_started"] = False
         _audio["assets_missing_on_start"] = False
         _audio["asset_missing_names"] = []
+        _audio["worker_process"] = None
         print(f"[WARN] Audio disabled: {exc}")
 
 
 def audio_try_finish_init():
-    """Load generated assets into pygame.mixer once the background worker finishes."""
+    """Load generated assets into pygame.mixer once the builder finishes."""
+    _poll_audio_builder_process()
     if _audio.get("ok") or not _audio.get("init_started") or _audio.get("load_attempted"):
         return
     if not _audio.get("assets_ready"):
@@ -4664,7 +5087,7 @@ def audio_try_finish_init():
         return
 
     try:
-        paths = _audio.get("asset_paths") or {}
+        paths = _audio.get("asset_paths") or expected_audio_asset_paths()
         sounds = {name: pygame.mixer.Sound(path) for name, path in paths.items()}
         _set_baseline_sound_volumes(sounds)
         _audio["sounds"] = sounds
@@ -4758,6 +5181,11 @@ def audio_stop_all(fade_ms: int = 250):
         audio_stop_loop(name, fade_ms)
 
 
+def audio_gain_db(volume: float, db: float) -> float:
+    """Return volume scaled by dB, clamped to pygame's 0..1 sound volume range."""
+    return clamp(float(volume) * (10.0 ** (float(db) / 20.0)), 0.0, 1.0)
+
+
 def audio_toggle_mute() -> bool:
     _audio["muted"] = not bool(_audio.get("muted"))
     if _audio["muted"]:
@@ -4818,17 +5246,18 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
     # portal climax where the dedicated portal wash should own the foreground.
     if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "time_intro"):
         if game_state in ("title", "quit_confirm"):
-            gamelan_vol = 0.165
+            gamelan_vol = 0.260
         elif game_state == "level_ready":
-            gamelan_vol = 0.140
+            gamelan_vol = 0.220
         elif game_state == "course_materialize":
-            gamelan_vol = 0.120
+            gamelan_vol = 0.205
         elif game_state == "result_overlay":
-            gamelan_vol = 0.100
+            gamelan_vol = 0.180
         elif game_state == "time_intro":
-            gamelan_vol = 0.075
+            gamelan_vol = 0.160
         else:
-            gamelan_vol = 0.110
+            gamelan_vol = 0.190
+        gamelan_vol = audio_gain_db(gamelan_vol, GAMELAN_GAIN_DB)
         audio_start_loop("gamelan", "gamelan", volume=gamelan_vol, fade_ms=1800)
     else:
         audio_stop_loop("gamelan", fade_ms=1300)
@@ -4882,13 +5311,14 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
         audio_start_loop("time_tick", "time", volume=0.20 + 0.18 * urgency, fade_ms=450)
 
         if game_state == "playing" and timed_leg_timer is not None:
-            # 10..5 seconds: long dynamite-style buzzer every second.
-            if TIME_SIREN_START_SECONDS < timed_leg_timer <= TIME_BUZZER_START_SECONDS:
-                buzz_urgency = 1.0 - clamp((timed_leg_timer - TIME_SIREN_START_SECONDS) / max(0.001, TIME_BUZZER_START_SECONDS - TIME_SIREN_START_SECONDS), 0.0, 1.0)
+            # Layered countdown: the tick-tock loop stays on for the whole leg.
+            # At 10 seconds, add the low BERRRRT buzzer on top. At 5 seconds,
+            # keep the buzzer going and add the higher WIUWIU siren on top of both.
+            if 0.0 < timed_leg_timer <= TIME_BUZZER_START_SECONDS:
+                buzz_urgency = 1.0 - clamp(timed_leg_timer / max(0.001, TIME_BUZZER_START_SECONDS), 0.0, 1.0)
                 audio_play("time_buzzer", volume=0.62 + 0.24 * buzz_urgency, channel_name="time_buzzer", cooldown=TIME_BUZZER_COOLDOWN_SECONDS)
-                audio_stop_loop("time_siren", fade_ms=120)
-            # 5..0 seconds: high-pitched WIUWIU panic siren.
-            elif 0.0 < timed_leg_timer <= TIME_SIREN_START_SECONDS:
+
+            if 0.0 < timed_leg_timer <= TIME_SIREN_START_SECONDS:
                 siren_urgency = 1.0 - clamp(timed_leg_timer / max(0.001, TIME_SIREN_START_SECONDS), 0.0, 1.0)
                 audio_start_loop("time_siren", "time_siren", volume=0.42 + 0.26 * siren_urgency, fade_ms=90)
             else:
@@ -5389,6 +5819,385 @@ def render_recoupling_recovery_prompt(player: "PlayerCube", t: float, recoupling
 # Init / main loop
 # -----------------------------------------------------------------------------
 
+SELECTED_SDL_VIDEO_DRIVER = None
+SELECTED_SDL_VIDEO_DRIVER_ACTUAL = None
+DISPLAY_ENV_REPORTED = False
+DISPLAY_ATTEMPT_FAILURES = []
+
+
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _is_windows() -> bool:
+    return os.name == "nt" or sys.platform.startswith("win")
+
+
+def _display_env_snapshot():
+    keys = (
+        "XDG_SESSION_TYPE",
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "SDL_VIDEODRIVER",
+        "XDG_CURRENT_DESKTOP",
+        "DESKTOP_SESSION",
+        "GDMSESSION",
+        "XDG_SESSION_ID",
+        "PYTHONPATH",
+        "LD_LIBRARY_PATH",
+        "CONDA_PREFIX",
+        "CONDA_DEFAULT_ENV",
+        "CONDA_SHLVL",
+    )
+    return {key: os.environ.get(key, "") for key in keys}
+
+
+def _fmt_env_value(value: str) -> str:
+    value = "" if value is None else str(value)
+    return value if value else "<unset>"
+
+
+def _conda_context():
+    """Best-effort Conda/Miniconda detection for startup diagnostics."""
+    env = _display_env_snapshot()
+    exe = os.path.realpath(sys.executable or "")
+    prefix = os.path.realpath(sys.prefix or "")
+    conda_prefix = env.get("CONDA_PREFIX", "").strip()
+    default_env = env.get("CONDA_DEFAULT_ENV", "").strip()
+    conda_shlvl = env.get("CONDA_SHLVL", "").strip()
+    haystack = " ".join([exe, prefix, conda_prefix, default_env]).lower()
+    detected = bool(conda_prefix or default_env or conda_shlvl) or any(
+        token in haystack for token in ("conda", "miniconda", "anaconda", "mambaforge", "miniforge")
+    )
+    return {
+        "detected": detected,
+        "prefix": conda_prefix or prefix,
+        "default_env": default_env,
+        "shlvl": conda_shlvl,
+        "executable": exe or sys.executable or "python",
+    }
+
+
+def _is_conda_python() -> bool:
+    return bool(_conda_context().get("detected"))
+
+
+def _display_process_hints():
+    """Best-effort process hints; useful when GNOME says Wayland but Xwayland exists."""
+    if not _is_linux():
+        return []
+    try:
+        result = subprocess.run(
+            ["ps", "-e", "-o", "comm=,args="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+            check=False,
+        )
+    except Exception:
+        return []
+    hints = []
+    wanted = ("Xorg", "Xwayland", "gnome-shell", "kwin_wayland", "kwin_x11")
+    for line in result.stdout.splitlines():
+        if any(name in line for name in wanted):
+            clean = " ".join(line.split())
+            if clean not in hints:
+                hints.append(clean[:180])
+        if len(hints) >= 8:
+            break
+    return hints
+
+
+def _report_display_environment_once():
+    global DISPLAY_ENV_REPORTED
+    if DISPLAY_ENV_REPORTED:
+        return
+    DISPLAY_ENV_REPORTED = True
+
+    env = _display_env_snapshot()
+    print(f"[INFO] Platform: {stdlib_platform.system()} {stdlib_platform.release()} ({sys.platform})")
+    print(f"[INFO] Python: {sys.version.split()[0]} at {sys.executable}")
+    conda = _conda_context()
+    if conda["detected"]:
+        print(
+            "[INFO] Conda environment detected: "
+            f"env={_fmt_env_value(conda['default_env'])} "
+            f"prefix={_fmt_env_value(conda['prefix'])} "
+            f"CONDA_SHLVL={_fmt_env_value(conda['shlvl'])}"
+        )
+    try:
+        print(f"[INFO] Pygame: {pygame.version.ver} / SDL {pygame.get_sdl_version()}")
+    except Exception:
+        pass
+
+    if _is_windows():
+        print("[INFO] Display environment: Windows native SDL video path.")
+        return
+
+    if _is_linux():
+        print(
+            "[INFO] Linux display environment: "
+            f"XDG_SESSION_TYPE={_fmt_env_value(env['XDG_SESSION_TYPE'])} "
+            f"WAYLAND_DISPLAY={_fmt_env_value(env['WAYLAND_DISPLAY'])} "
+            f"DISPLAY={_fmt_env_value(env['DISPLAY'])} "
+            f"SDL_VIDEODRIVER={_fmt_env_value(env['SDL_VIDEODRIVER'])}"
+        )
+        print(
+            "[INFO] Desktop hints: "
+            f"XDG_CURRENT_DESKTOP={_fmt_env_value(env['XDG_CURRENT_DESKTOP'])} "
+            f"DESKTOP_SESSION={_fmt_env_value(env['DESKTOP_SESSION'])} "
+            f"GDMSESSION={_fmt_env_value(env['GDMSESSION'])}"
+        )
+        ld_library_path = env.get("LD_LIBRARY_PATH", "").strip()
+        pythonpath = env.get("PYTHONPATH", "").strip()
+        if ld_library_path:
+            print("[WARN] LD_LIBRARY_PATH is set. This can override SDL/OpenGL/Mesa libraries and break Pygame OpenGL context creation.")
+            print(f"[WARN] Current LD_LIBRARY_PATH={ld_library_path}")
+            print("[WARN] Try: unset LD_LIBRARY_PATH")
+        if pythonpath:
+            print("[WARN] PYTHONPATH is set. This can make Python import packages from unexpected locations.")
+            print(f"[WARN] Current PYTHONPATH={pythonpath}")
+            print("[WARN] Try: unset PYTHONPATH")
+        hints = _display_process_hints()
+        if hints:
+            print("[INFO] Display process hints:")
+            for line in hints:
+                print(f"[INFO]   {line}")
+        return
+
+    print("[INFO] Display environment: non-Windows/non-Linux SDL default path.")
+
+
+def _linux_display_preflight_or_exit():
+    """Quit cleanly when there is obviously no graphical display to open."""
+    if not _is_linux():
+        return
+    env = _display_env_snapshot()
+    if not env["DISPLAY"] and not env["WAYLAND_DISPLAY"]:
+        print("[ERROR] No Linux graphical display was detected.", file=sys.stderr)
+        print("[ERROR] DISPLAY and WAYLAND_DISPLAY are both unset, so Pygame cannot open a window.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Run Cube Libre from a graphical desktop session, or use SSH with X forwarding only if OpenGL forwarding works.", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _sdl_driver_candidates():
+    """Return SDL video-driver candidates in the order we should try them.
+
+    None means: remove SDL_VIDEODRIVER and let SDL/Pygame choose. On Linux we
+    then explicitly try wayland/x11 where relevant, because SDL's default choice
+    can be wrong or incomplete on mixed Wayland/Xwayland systems.
+    """
+    if not _is_linux():
+        return [None]
+
+    env = _display_env_snapshot()
+    session = env["XDG_SESSION_TYPE"].strip().lower()
+    has_wayland = bool(env["WAYLAND_DISPLAY"].strip())
+    has_x11 = bool(env["DISPLAY"].strip())
+    manual = env["SDL_VIDEODRIVER"].strip()
+
+    candidates = []
+
+    def add(candidate):
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    if manual:
+        add(manual)
+
+    add(None)  # SDL/Pygame default, with SDL_VIDEODRIVER unset.
+
+    if session == "wayland":
+        if has_wayland:
+            add("wayland")
+        if has_x11:
+            add("x11")  # Xwayland fallback inside a Wayland session.
+    elif session in ("x11", "xorg"):
+        if has_x11:
+            add("x11")
+        if has_wayland:
+            add("wayland")
+    else:
+        if has_wayland:
+            add("wayland")
+        if has_x11:
+            add("x11")
+
+    return candidates
+
+
+def _candidate_label(candidate) -> str:
+    return "SDL default" if candidate is None else f"SDL_VIDEODRIVER={candidate}"
+
+
+def _apply_sdl_driver_candidate(candidate):
+    if candidate is None:
+        os.environ.pop("SDL_VIDEODRIVER", None)
+    else:
+        os.environ["SDL_VIDEODRIVER"] = str(candidate)
+
+
+def _set_gl_compat_attributes(profile: str):
+    """Set GL attributes before set_mode(). profile='default' leaves SDL alone."""
+    if profile == "default":
+        return
+    try:
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
+    except Exception:
+        pass
+    # Ask for a compatibility profile when SDL/Pygame exposes the constants.
+    # If unavailable, this silently degrades to the version request above.
+    try:
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_COMPATIBILITY)
+    except Exception:
+        pass
+
+
+def _try_set_mode_once(mode_size, flags, candidate, profile: str):
+    _apply_sdl_driver_candidate(candidate)
+    try:
+        pygame.display.quit()
+    except Exception:
+        pass
+    try:
+        pygame.display.init()
+    except Exception as exc:
+        return False, None, f"display init failed: {exc}"
+
+    pre_driver = None
+    try:
+        pre_driver = pygame.display.get_driver()
+    except Exception:
+        pass
+
+    _set_gl_compat_attributes(profile)
+
+    try:
+        pygame.display.set_mode(mode_size, flags)
+    except Exception as exc:
+        try:
+            pygame.display.quit()
+        except Exception:
+            pass
+        driver_text = f"preselected SDL driver {pre_driver!r}; " if pre_driver else ""
+        return False, pre_driver, driver_text + str(exc)
+
+    try:
+        actual = pygame.display.get_driver()
+    except Exception:
+        actual = pre_driver
+    return True, actual, None
+
+
+def _print_display_failure_help(failures):
+    env = _display_env_snapshot()
+    print("[ERROR] Cube Libre could not create a Pygame/OpenGL display.", file=sys.stderr)
+    print("[ERROR] This is a windowing/OpenGL context creation failure, not a gameplay-code crash.", file=sys.stderr)
+    print("", file=sys.stderr)
+    if _is_linux():
+        print("Linux display environment:", file=sys.stderr)
+        for key, value in env.items():
+            print(f"  {key}={_fmt_env_value(value)}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+    print("Display attempts:", file=sys.stderr)
+    for label, profile, error in failures:
+        print(f"  - {label}, GL profile {profile}: {error}", file=sys.stderr)
+
+    if _is_linux():
+        print("", file=sys.stderr)
+        if env.get("LD_LIBRARY_PATH", "").strip():
+            print("Warning: LD_LIBRARY_PATH is set and may override SDL/OpenGL/Mesa libraries.", file=sys.stderr)
+            print("Try before launching Cube Libre:", file=sys.stderr)
+            print("  unset LD_LIBRARY_PATH", file=sys.stderr)
+            print("", file=sys.stderr)
+        if env.get("PYTHONPATH", "").strip():
+            print("Warning: PYTHONPATH is set and may affect which Python packages are imported.", file=sys.stderr)
+            print("Try before launching Cube Libre:", file=sys.stderr)
+            print("  unset PYTHONPATH", file=sys.stderr)
+            print("", file=sys.stderr)
+
+        conda = _conda_context()
+        if conda["detected"]:
+            print("Conda environment detected during this failed launch:", file=sys.stderr)
+            print(f"  env={_fmt_env_value(conda['default_env'])}", file=sys.stderr)
+            print(f"  prefix={_fmt_env_value(conda['prefix'])}", file=sys.stderr)
+            print(f"  executable={_fmt_env_value(conda['executable'])}", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Conda-specific fixes to try:", file=sys.stderr)
+            print("  conda update --all", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Or create a clean Cube Libre Conda env instead of using base:", file=sys.stderr)
+            print("  conda create -n cube-libre python=3.12 pygame pyopengl numpy", file=sys.stderr)
+            print("  conda activate cube-libre", file=sys.stderr)
+            print("  unset SDL_VIDEODRIVER PYTHONPATH LD_LIBRARY_PATH", file=sys.stderr)
+            print(f"  python {_quote_cmd_part(sys.argv[0])}", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Known-good Ubuntu fallback:", file=sys.stderr)
+            print("  sudo apt install python3-pygame python3-opengl python3-numpy", file=sys.stderr)
+            print(f"  env -u SDL_VIDEODRIVER -u PYTHONPATH -u LD_LIBRARY_PATH /usr/bin/python3 {_quote_cmd_part(sys.argv[0])}", file=sys.stderr)
+            print("", file=sys.stderr)
+
+        print("Useful checks on Ubuntu:", file=sys.stderr)
+        print("  echo $XDG_SESSION_TYPE", file=sys.stderr)
+        print("  echo $WAYLAND_DISPLAY", file=sys.stderr)
+        print("  echo $DISPLAY", file=sys.stderr)
+        print("  echo $LD_LIBRARY_PATH", file=sys.stderr)
+        print("  echo $PYTHONPATH", file=sys.stderr)
+        print("  glxinfo -B", file=sys.stderr)
+        print("  eglinfo | head -80", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("If glxinfo/eglinfo are missing:", file=sys.stderr)
+        print("  sudo apt install mesa-utils mesa-utils-extra", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Manual backend tests:", file=sys.stderr)
+        print(f"  SDL_VIDEODRIVER=wayland {_quote_cmd_part(sys.executable)} {_quote_cmd_part(sys.argv[0])}", file=sys.stderr)
+        print(f"  SDL_VIDEODRIVER=x11 {_quote_cmd_part(sys.executable)} {_quote_cmd_part(sys.argv[0])}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("GNOME note: in a Wayland session, DISPLAY=:0 usually means Xwayland is available; it does not mean the session is X11.", file=sys.stderr)
+        print("To test a real X11 session, log out and choose 'Ubuntu on Xorg' from the gear icon on the login screen.", file=sys.stderr)
+        if not _is_conda_python():
+            print("", file=sys.stderr)
+            print("Conda note: if this works outside Conda but fails inside Conda, update Conda or use a clean non-base Conda environment.", file=sys.stderr)
+
+
+def _set_game_display_robust(mode_size, flags):
+    global SELECTED_SDL_VIDEO_DRIVER, SELECTED_SDL_VIDEO_DRIVER_ACTUAL, DISPLAY_ATTEMPT_FAILURES
+
+    # After a successful first window, toggles/resizes should normally reuse the
+    # same selected SDL backend. If that fails, fall through to the full candidate
+    # ladder so fullscreen changes do not permanently brick the run.
+    candidates = []
+    if SELECTED_SDL_VIDEO_DRIVER is not None:
+        candidates.append(SELECTED_SDL_VIDEO_DRIVER)
+    for candidate in _sdl_driver_candidates():
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    profiles = ("default", "compat-2.1")
+    failures = []
+    for candidate in candidates:
+        for profile in profiles:
+            label = _candidate_label(candidate)
+            print(f"[INFO] Trying OpenGL display via {label}, GL profile {profile}...")
+            ok, actual_driver, error = _try_set_mode_once(mode_size, flags, candidate, profile)
+            if ok:
+                SELECTED_SDL_VIDEO_DRIVER = actual_driver if _is_linux() else candidate
+                SELECTED_SDL_VIDEO_DRIVER_ACTUAL = actual_driver
+                DISPLAY_ATTEMPT_FAILURES = failures
+                print(f"[INFO] OpenGL display created with SDL driver: {actual_driver or '<unknown>'}")
+                return
+            print(f"[WARN] Display attempt failed via {label}, GL profile {profile}: {error}")
+            failures.append((label, profile, error))
+
+    DISPLAY_ATTEMPT_FAILURES = failures
+    _print_display_failure_help(failures)
+    raise SystemExit(2)
+
+
 def _current_window_size(preferred_size=None):
     """Best-effort current drawable/window size for pygame+OpenGL.
 
@@ -5480,7 +6289,7 @@ def set_game_display(size=None, fullscreen=None):
         flags |= RESIZABLE
         mode_size = WINDOWED_DISPLAY
 
-    pygame.display.set_mode(mode_size, flags)
+    _set_game_display_robust(mode_size, flags)
     LAST_GL_VIEWPORT_SIZE = None
     pygame.display.set_caption(f"Cube Libre (demo, v.{version_number})")
     apply_gl_viewport_for_display(mode_size, force=True)
@@ -5492,11 +6301,8 @@ def toggle_fullscreen():
 
 
 def init_pygame_and_gl():
-    is_wayland = 'WAYLAND_DISPLAY' in os.environ
-    if is_wayland:
-        print("[INFO] Detected Wayland. Using SDL/Pygame defaults for GL context.")
-    else:
-        print("[INFO] Using X11/Windows/SDL default windowing path.")
+    _report_display_environment_once()
+    _linux_display_preflight_or_exit()
 
     try:
         pygame.mixer.pre_init(AUDIO_SAMPLE_RATE, -16, 2, 512)
@@ -5505,13 +6311,6 @@ def init_pygame_and_gl():
 
     pygame.init()
     pygame.font.init()
-
-    # Compatibility profile because this prototype intentionally uses immediate-mode GL.
-    try:
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
-    except Exception:
-        pass
 
     set_game_display(DISPLAY, fullscreen=False)
 
@@ -5686,6 +6485,23 @@ def draw_scene(player: PlayerCube, t: float, scene_angles, draw_player_body: boo
     draw_impact_effects(t)
 
     render_flash_overlay()
+
+
+def audio_builder_main(argv=None) -> int:
+    """CLI entry point for the isolated procedural-audio cache builder."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    force = "--force" in argv
+    try:
+        paths = generate_audio_assets(force=force)
+        missing = [name for name, path in paths.items() if not os.path.exists(path)]
+        if missing:
+            print("[ERROR] Audio cache builder finished with missing assets: " + ", ".join(missing), file=sys.stderr)
+            return 2
+        print(f"[INFO] Audio cache builder finished: {_audio_dir()}")
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] Audio cache builder failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 def main():
@@ -6420,4 +7236,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if AUDIO_BUILDER_ARG in sys.argv:
+        raise SystemExit(audio_builder_main(sys.argv[1:]))
     main()

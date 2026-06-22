@@ -22,7 +22,7 @@ The player starts as a 5×5×5 cube, 125 smaller cubes total. Each surviving cub
 
 Core mechanics currently explored:
 
-- constantly rotating camera that is mostly beyond player control
+- constantly rotating camera mostly beyond absolute player control
 - rotating laser-grid obstacle fields
 - modular tunnel / L-joint maze progression
 - cube-body damage, fragmentation, and re-coupling
