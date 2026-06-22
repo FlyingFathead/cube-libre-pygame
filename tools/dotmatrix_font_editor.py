@@ -3,7 +3,7 @@
 Standalone dot-matrix font editor/viewer for Cube Libre.
 
 Run:
-    python dotmatrix_font_editor.py --font cube_libre_5x7.json
+    python tools/dotmatrix_font_editor.py --font assets/fonts/cube_libre_5x7.json
 
 Controls:
     Mouse left      toggle glyph cell / select character from right palette
@@ -23,9 +23,14 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from typing import List, Optional, Tuple
 
-from dotmatrix_font import DEFAULT_CHARSET, DotMatrixFont, blank_glyph, normalize_glyph
+from cube_libre.dotmatrix_font import DEFAULT_CHARSET, DotMatrixFont, blank_glyph, normalize_glyph
 
 BG = (13, 14, 22)
 PANEL = (24, 26, 40)

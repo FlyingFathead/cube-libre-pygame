@@ -20,3 +20,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+
+__pycache__/
+*.pyc
+cube_libre_scores.json
+
+# Generated procedural audio cache
+assets/sfx/

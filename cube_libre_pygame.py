@@ -193,7 +193,7 @@ LEVEL_READY_FADE_IN_SECONDS = 0.95
 # silently if pygame cannot open an audio device.
 AUDIO_ENABLED = True
 AUDIO_SAMPLE_RATE = 44100
-AUDIO_DIR_NAME = "cube_libre_sfx"
+AUDIO_DIR_NAME = os.path.join("assets", "sfx")
 # First-run audio rendering is CPU-heavy pure Python. Keep it out of the
 # Pygame process so Linux/Wayland/GNOME does not think the window has frozen
 # while the WAV cache is being built.
@@ -583,7 +583,7 @@ def get_font(size: int, bold: bool = False):
 # Missing/broken dotmatrix support prints one warning and falls back to get_font().
 
 DOTMATRIX_FONT_FILE = os.path.join("assets", "fonts", "cube_libre_5x7.json")
-DOTMATRIX_EDITOR_FILE = "dotmatrix_font_editor.py"
+DOTMATRIX_EDITOR_FILE = os.path.join("tools", "dotmatrix_font_editor.py")
 DOTMATRIX_REQUIRED_CHARS = "".join(dict.fromkeys("SPACE / ENTER = NEW RUNRENDERING AUDIO ASSETS - PLEASE WAITAUDIO DISABLEDÅÄÖÜåäöü?".replace(" ", "")))
 
 _dotmatrix_font = None
@@ -611,7 +611,7 @@ def get_dotmatrix_font():
     """Load the optional procedural dot-matrix font once, or return None.
 
     Runtime files expected in the repository root/layout:
-      - dotmatrix_font.py
+      - cube_libre/dotmatrix_font.py
       - assets/fonts/cube_libre_5x7.json
 
     The standalone editor is also checked so local builds warn if the generator
@@ -623,7 +623,7 @@ def get_dotmatrix_font():
     _dotmatrix_checked = True
 
     try:
-        from dotmatrix_font import DotMatrixFont
+        from cube_libre.dotmatrix_font import DotMatrixFont
     except Exception as exc:
         _warn_dotmatrix(f"could not import dotmatrix_font.py ({exc.__class__.__name__}: {exc})")
         return None
