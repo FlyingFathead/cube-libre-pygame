@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.77-ember fragments"
+version_number = "0.15.78-entropy phase"
 
 import colorsys
 import importlib.util
@@ -443,6 +443,14 @@ TIME_TIMER_WARNING_SECONDS = 8.0
 TIME_BUZZER_START_SECONDS = 10.0
 TIME_SIREN_START_SECONDS = 5.0
 TIME_BUZZER_COOLDOWN_SECONDS = 0.82
+
+# Entropy phase. Starting at level 10, re-coupling becomes nastier: the base
+# 90% lossy recovery stays intact for earlier levels, but entropy drops the
+# effective gather rate to 50% and announces the phase once, like SPACE/TIME.
+ENTROPY_MODE_START_LEVEL = 10
+ENTROPY_RECOUPLING_GATHER_RATE = 0.50
+ENTROPY_INTRO_SECONDS = 3.20
+ENTROPY_INTRO_FADE_IN_SECONDS = 1.10
 
 # Audio mix tuning. Keep runtime mixer gain separate from source-file gain.
 # The alien-gamelan WAV is deliberately generated/copied from the safe old synth
@@ -1615,7 +1623,7 @@ def render_help_overlay(t: float, game_state: str, level: int):
         (body, "Q / E                 move on world Z", (210, 235, 240), 172),
         (body, "Hold Shift            rush", (210, 235, 240), 198),
         (body, f"C                     request re-coupling; loose cubes expire after {RECOUPLING_FRAGMENT_RECOVERABLE_SECONDS:.0f}s", (185, 255, 205), 224),
-        (body, f"                      gather rate: {RECOUPLING_GATHER_RATE * 100:.0f}%   limit: {RECOUPLING_REQUEST_LIMIT} per {RECOUPLING_REQUEST_WINDOW_SECONDS:.0f}s", (170, 230, 190), 248),
+        (body, f"                      gather rate: {recoupling_gather_rate_for_level(level) * 100:.0f}%   limit: {RECOUPLING_REQUEST_LIMIT} per {RECOUPLING_REQUEST_WINDOW_SECONDS:.0f}s", (170, 230, 190), 248),
         (head, "SYSTEM", (220, 255, 255), 276),
         (body, "P                     pause / resume game and audio", (210, 235, 240), 304),
         (body, "L                     locate camera: center view on cube", (210, 235, 240), 328),
@@ -1993,6 +2001,16 @@ def recoupling_request_limit_for_level(level: int) -> int:
     )
 
 
+def recoupling_gather_rate_for_level(level: int = None) -> float:
+    """Effective C-request gather fraction for the current difficulty phase."""
+    if level is None:
+        level = globals().get("ACTIVE_LEVEL", 1)
+    level = max(1, int(level))
+    if level >= ENTROPY_MODE_START_LEVEL:
+        return clamp(ENTROPY_RECOUPLING_GATHER_RATE, 0.0, 1.0)
+    return clamp(RECOUPLING_GATHER_RATE, 0.0, 1.0)
+
+
 def _recoupling_target_cells(player: "PlayerCube", count: int):
     """Pick missing local cells so the body rebuilds toward a compact cube.
 
@@ -2044,7 +2062,7 @@ def begin_recoupling(player: "PlayerCube"):
     # fragment. At the default 0.90, ten available loose cubes usually gather about
     # nine, leaving the rest to keep drifting/blinking toward expiry. A tiny
     # stochastic rounding step avoids always flooring 9.9 to 9 etc.
-    gather_rate = clamp(RECOUPLING_GATHER_RATE, 0.0, 1.0)
+    gather_rate = recoupling_gather_rate_for_level(ACTIVE_LEVEL)
     if gather_rate <= 0.0:
         return []
     desired = max_count * gather_rate
@@ -6288,7 +6306,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
 
     # Slow ship-engine ambience: present on the title screen and normal level,
     # softer during overlays, absent in the hard-white death void and portal wash.
-    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "space_intro", "time_intro"):
+    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "space_intro", "time_intro", "entropy_intro"):
         charge = portal_overlap_charge(player) if game_state == "playing" else 0.0
         if game_state in ("title", "quit_confirm"):
             ambient_vol = 0.34
@@ -6298,7 +6316,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
             ambient_vol = 0.20
         elif game_state == "result_overlay":
             ambient_vol = 0.17
-        elif game_state in ("space_intro", "time_intro"):
+        elif game_state in ("space_intro", "time_intro", "entropy_intro"):
             ambient_vol = 0.20
         else:
             ambient_vol = 0.15 + 0.05 * charge
@@ -6309,7 +6327,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
     # Sparse alien-gamelan tones: long struck-metal notes with long pauses. This is
     # menu/level atmosphere, so it stays away from the hard-white death void and the
     # portal climax where the dedicated portal wash should own the foreground.
-    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "space_intro", "time_intro"):
+    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "space_intro", "time_intro", "entropy_intro"):
         if game_state in ("title", "quit_confirm"):
             gamelan_vol = 0.260
         elif game_state == "level_ready":
@@ -6318,7 +6336,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
             gamelan_vol = 0.205
         elif game_state == "result_overlay":
             gamelan_vol = 0.180
-        elif game_state in ("space_intro", "time_intro"):
+        elif game_state in ("space_intro", "time_intro", "entropy_intro"):
             gamelan_vol = 0.160
         else:
             gamelan_vol = 0.190
@@ -6780,6 +6798,15 @@ def render_time_intro(t: float, timer: float):
         t, timer, TIME_INTRO_SECONDS, TIME_INTRO_FADE_IN_SECONDS,
         "TIME ...",
         f"{int(TIME_PER_LEG_SECONDS)} SECONDS PER LEG FROM HERE",
+    )
+
+
+def render_entropy_intro(t: float, timer: float):
+    """White void announcement before level 10 cuts re-coupling recovery."""
+    _render_void_intro_card(
+        t, timer, ENTROPY_INTRO_SECONDS, ENTROPY_INTRO_FADE_IN_SECONDS,
+        "ENTROPY ...",
+        f"RE-COUPLING GATHER RATE DOWN TO {int(ENTROPY_RECOUPLING_GATHER_RATE * 100)}%",
     )
 
 
@@ -7718,6 +7745,8 @@ def main():
     space_intro_timer = 0.0
     timed_mode_intro_seen = False
     time_intro_timer = 0.0
+    entropy_mode_intro_seen = False
+    entropy_intro_timer = 0.0
     timed_leg_timer = TIME_PER_LEG_SECONDS
     timed_current_module = 0
     boundary_outside_timer = 0.0
@@ -7727,7 +7756,7 @@ def main():
     # Small explicit state machine. This prevents title, level ready, course materialization,
     # death/white-void reassembly, portal warp, input and scoring overlays from stomping on
     # each other.
-    game_state = "title"  # title | quit_confirm | level_ready | space_intro | time_intro | course_materialize | playing | death_dissolve | reassembly | reassembly_flash | portal_warp | result_overlay
+    game_state = "title"  # title | quit_confirm | level_ready | space_intro | time_intro | entropy_intro | course_materialize | playing | death_dissolve | reassembly | reassembly_flash | portal_warp | result_overlay
     # menu_confirm_active is a modal overlay, not a game_state: it freezes the current run underneath it.
     death_timer = 0.0
     level_ready_timer = 0.0
@@ -7905,13 +7934,15 @@ def main():
 
     def start_new_run(label="NEW RUN"):
         nonlocal score, completed_level, next_level_to_start, last_escape_count, win_overlay_timer, portal_warp_timer, death_timer, course_materialize_timer
-        nonlocal spatial_mode_intro_seen, space_intro_timer, timed_mode_intro_seen, time_intro_timer, timed_leg_timer, timed_current_module
+        nonlocal spatial_mode_intro_seen, space_intro_timer, timed_mode_intro_seen, time_intro_timer, entropy_mode_intro_seen, entropy_intro_timer, timed_leg_timer, timed_current_module
         score = 0
         completed_level = 0
         spatial_mode_intro_seen = False
         space_intro_timer = 0.0
         timed_mode_intro_seen = False
         time_intro_timer = 0.0
+        entropy_mode_intro_seen = False
+        entropy_intro_timer = 0.0
         timed_leg_timer = TIME_PER_LEG_SECONDS
         timed_current_module = 0
         next_level_to_start = 1
@@ -7930,7 +7961,7 @@ def main():
         which matters once a run has reached deeper levels.
         """
         nonlocal next_level_to_start, last_escape_count, win_overlay_timer, portal_warp_timer, death_timer, course_materialize_timer
-        nonlocal space_intro_timer, time_intro_timer, timed_leg_timer, timed_current_module
+        nonlocal space_intro_timer, time_intro_timer, entropy_intro_timer, timed_leg_timer, timed_current_module
         target = max(1, int(current_level))
         next_level_to_start = max(next_level_to_start, target)
         last_escape_count = 0
@@ -7940,6 +7971,7 @@ def main():
         course_materialize_timer = 0.0
         space_intro_timer = 0.0
         time_intro_timer = 0.0
+        entropy_intro_timer = 0.0
         timed_leg_timer = TIME_PER_LEG_SECONDS
         timed_current_module = 0
         begin_level_ready(target, f"{label}: LEVEL {target}")
@@ -7999,8 +8031,19 @@ def main():
         game_state = "time_intro"
         set_message("TIME ...", TIME_INTRO_SECONDS)
 
+    def begin_entropy_intro(target_level: int):
+        nonlocal game_state, entropy_intro_timer, current_level, next_level_to_start, damage_timer, paused
+        paused = False
+        audio_resume_all()
+        current_level = max(ENTROPY_MODE_START_LEVEL, int(target_level))
+        next_level_to_start = current_level
+        entropy_intro_timer = 0.0
+        damage_timer = 999.0
+        game_state = "entropy_intro"
+        set_message("ENTROPY ...", ENTROPY_INTRO_SECONDS)
+
     def advance_after_transcendence():
-        nonlocal next_level_to_start, spatial_mode_intro_seen, timed_mode_intro_seen
+        nonlocal next_level_to_start, spatial_mode_intro_seen, timed_mode_intro_seen, entropy_mode_intro_seen
         # Belt-and-suspenders against the recurring "level 1 twice" bug: if a
         # result overlay exists, never allow the next level to be less than the
         # just-completed level + 1, regardless of stale UI/event state.
@@ -8014,6 +8057,9 @@ def main():
         elif target >= TIME_MODE_START_LEVEL and completed_level == TIME_MODE_START_LEVEL - 1 and not timed_mode_intro_seen:
             timed_mode_intro_seen = True
             begin_time_intro(target)
+        elif target >= ENTROPY_MODE_START_LEVEL and completed_level == ENTROPY_MODE_START_LEVEL - 1 and not entropy_mode_intro_seen:
+            entropy_mode_intro_seen = True
+            begin_entropy_intro(target)
         else:
             begin_level_ready(target, f"LEVEL {target} GET READY")
 
@@ -8599,7 +8645,7 @@ def main():
                     # the old R-based chord, but R sits too close to normal movement keys and
                     # is too easy to hit while playing.
                     active_run_states = (
-                        "level_ready", "space_intro", "time_intro", "course_materialize", "playing",
+                        "level_ready", "space_intro", "time_intro", "entropy_intro", "course_materialize", "playing",
                         "death_dissolve", "reassembly", "reassembly_flash", "portal_warp",
                     )
                     if game_state in active_run_states:
@@ -8662,6 +8708,11 @@ def main():
         elif game_state == "time_intro":
             time_intro_timer += dt
             if time_intro_timer >= TIME_INTRO_SECONDS:
+                begin_level_ready(next_level_to_start, f"LEVEL {next_level_to_start} GET READY")
+
+        elif game_state == "entropy_intro":
+            entropy_intro_timer += dt
+            if entropy_intro_timer >= ENTROPY_INTRO_SECONDS:
                 begin_level_ready(next_level_to_start, f"LEVEL {next_level_to_start} GET READY")
 
         elif game_state == "course_materialize":
@@ -8832,6 +8883,8 @@ def main():
             render_space_intro(t, space_intro_timer)
         elif game_state == "time_intro":
             render_time_intro(t, time_intro_timer)
+        elif game_state == "entropy_intro":
+            render_entropy_intro(t, entropy_intro_timer)
         else:
             if game_state == "course_materialize":
                 progress = clamp(course_materialize_timer / COURSE_MATERIALIZE_SECONDS, 0.0, 1.0)
