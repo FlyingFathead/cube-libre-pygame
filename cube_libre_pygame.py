@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.74-bounds zero death"
+version_number = "0.15.76-boundary heat tuning"
 
 import colorsys
 import importlib.util
@@ -310,6 +310,25 @@ BOUNDARY_DAMAGE_PAD = 0.25
 # means: no cubes left = you die, as expected.
 BOUNDARY_DAMAGE_CAN_KILL = True
 BOUNDARY_DAMAGE_MIN_SURVIVORS = 0
+# Out-of-bounds heat mechanic. Leaving the playable tunnel/cage is a grace-period
+# warning first; staying outside past BOUNDARY_OVERHEAT_SECONDS turns the cube
+# red-hot, shows OVERHEATING, and accelerates boundary decay until the player
+# gets back inside. On re-entry the cube cools blue/cyan before returning to
+# its normal palette.
+BOUNDARY_OVERHEAT_SECONDS = 2.40
+BOUNDARY_OVERHEAT_RAMP_SECONDS = 1.15
+# Mild by default: overheat should pressure the player, not turn the boundary
+# into an instant blender. 1.15 means roughly +15% faster boundary decay at full
+# overheat; keep this around 1.10-1.20 unless you deliberately want brutality.
+BOUNDARY_OVERHEAT_DECAY_ACCELERATION = 1.15
+# Extra cells-per-damage-event multiplier. With the default MAX_DAMAGE_PER_EVENT=2
+# and the floor-based cap below, 1.15 does not increase chunk size; it is here for
+# later tuning without changing code.
+BOUNDARY_OVERHEAT_MAX_DAMAGE_MULTIPLIER = 1.15
+BOUNDARY_OVERHEAT_COOL_SECONDS = 1.75
+BOUNDARY_OVERHEAT_VISUAL_MIN_HEAT = 0.38
+BOUNDARY_OVERHEAT_FLAMES_ENABLED = True
+BOUNDARY_OVERHEAT_FLAME_COUNT = 26
 # Small laser mercy only inside the actual same-size joint cube. This prevents
 # seam shaving without deleting obstacle grids from the corridor modules.
 TURN_JOINT_LASER_PAD = 0.0
@@ -4280,10 +4299,28 @@ def draw_player(player: PlayerCube, absorb_portal_cells: bool = False, t: float 
         glTranslatef(p.x, p.y, p.z)
         cell_color, flash_outline = player_flash_tint(player.color_for_cell(cell), t)
         draw_unit_cube(cell_color, 1.0, outline=True, outline_color=flash_outline)
+
+        # Cheap red-hot bloom during boundary overheat. This is intentionally just
+        # a slightly larger additive cube pass, not a particle system or shader.
+        heat = clamp(BOUNDARY_HEAT_VISUAL, 0.0, 1.0)
+        if heat > 0.02:
+            pulse = 0.5 + 0.5 * math.sin(t * math.tau * (6.0 + 5.0 * heat) + (cell[0] + cell[1] * 3 + cell[2] * 5))
+            hot_alpha = (0.055 + 0.20 * heat) * (0.72 + 0.28 * pulse)
+            hot_color = (1.0, 0.10 + 0.26 * pulse, 0.015)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+            bloom_scale = 1.035 + 0.075 * heat + 0.025 * pulse
+            glScalef(bloom_scale, bloom_scale, bloom_scale)
+            draw_unit_cube(hot_color, hot_alpha, outline=False)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glDisable(GL_BLEND)
+
         glPopMatrix()
 
-    # Debris/fragments. The pieces no longer stay candy-colored forever; they
-    # bleach white and then cool toward grey as they drift off.
+    draw_player_heat_flames(player, t, BOUNDARY_HEAT_VISUAL)
+
+    # Debris/fragments. Fresh pieces knocked off during overheat glow red-hot
+    # briefly, then bleach/cool toward grey as they drift away.
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
     for f in player.fragments:
@@ -4293,9 +4330,16 @@ def draw_player(player: PlayerCube, absorb_portal_cells: bool = False, t: float 
         glRotatef(f.rot_angle, a.x, a.y, a.z)
         blink = fragment_blink_alpha(f, t)
         alpha = (0.35 + 0.55 * f.alpha) * blink
+        frag_color, frag_outline = fragment_thermal_tint(f, t)
         # Blinking expired-ish cubes get a faint outline so the player sees
         # the last chance to hit C before that chunk is gone for the level.
-        draw_unit_cube(fragment_fade_color(f), alpha, outline=f.expiry_warning)
+        draw_unit_cube(frag_color, alpha, outline=(f.expiry_warning or frag_outline is not None), outline_color=frag_outline)
+        if BOUNDARY_HEAT_VISUAL > 0.03 and f.expiry_ratio < 0.72:
+            pulse = 0.5 + 0.5 * math.sin(t * math.tau * 7.4 + f.rot_angle * 0.017)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+            glScalef(1.05 + 0.06 * BOUNDARY_HEAT_VISUAL, 1.05 + 0.06 * BOUNDARY_HEAT_VISUAL, 1.05 + 0.06 * BOUNDARY_HEAT_VISUAL)
+            draw_unit_cube((1.0, 0.11 + 0.28 * pulse, 0.02), 0.05 + 0.17 * BOUNDARY_HEAT_VISUAL * (1.0 - f.expiry_ratio), outline=False)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glPopMatrix()
     glDisable(GL_BLEND)
 
@@ -4381,15 +4425,147 @@ def trigger_cube_impact_flash(color, seconds: float = CUBE_IMPACT_FLASH_SECONDS)
     CUBE_IMPACT_FLASH_COLOR = color
 
 
+BOUNDARY_HEAT_VISUAL = 0.0
+BOUNDARY_COOL_VISUAL = 0.0
+
+
+def set_boundary_thermal_visual(heat: float = 0.0, cool: float = 0.0):
+    """Update global player-body heat/cool tint values for draw_player().
+
+    Kept global because draw_player()/player_flash_tint() live outside main(),
+    while the actual out-of-bounds timer is per-run state inside main().
+    """
+    global BOUNDARY_HEAT_VISUAL, BOUNDARY_COOL_VISUAL
+    BOUNDARY_HEAT_VISUAL = clamp(float(heat), 0.0, 1.0)
+    BOUNDARY_COOL_VISUAL = clamp(float(cool), 0.0, 1.0)
+
+
+def fragment_thermal_tint(fragment: Fragment, t: float):
+    """Hot fragments glow while newly knocked off, then return to normal fade.
+
+    The base fragment fade still wins as pieces age, so fragments do not stay
+    permanently red; they leave the cube red-hot and end up grey/ashy.
+    """
+    base = fragment_fade_color(fragment)
+    heat = clamp(BOUNDARY_HEAT_VISUAL, 0.0, 1.0)
+    if heat <= 0.005:
+        return base, None
+
+    young = smoothstep((0.78 - fragment.expiry_ratio) / 0.78)
+    if young <= 0.005:
+        return base, None
+
+    pulse = 0.5 + 0.5 * math.sin(t * math.tau * (5.8 + 2.5 * heat) + fragment.rot_angle * 0.011)
+    hot = (1.0, 0.10 + 0.32 * pulse, 0.02)
+    white_hot = (1.0, 0.78, 0.28)
+    hot = tuple(hot[i] * (1.0 - 0.22 * pulse) + white_hot[i] * (0.22 * pulse) for i in range(3))
+    mix = clamp((0.35 + 0.50 * heat) * young, 0.0, 0.90)
+    color = tuple(base[i] * (1.0 - mix) + hot[i] * mix for i in range(3))
+    outline = (1.0, 0.30 + 0.45 * pulse, 0.03) if mix > 0.22 else None
+    return color, outline
+
+
+def draw_player_heat_flames(player: PlayerCube, t: float, heat: float):
+    """Very cheap procedural overheat corona around the cube body.
+
+    This uses a fixed number of additive GL line strips. No particle simulation, no
+    per-flame objects, no extra lifetime bookkeeping.
+    """
+    if not BOUNDARY_OVERHEAT_FLAMES_ENABLED:
+        return
+    heat = clamp(heat, 0.0, 1.0)
+    if heat <= 0.03 or player is None or player.intact_count() <= 0:
+        return
+
+    count = max(0, int(BOUNDARY_OVERHEAT_FLAME_COUNT))
+    if count <= 0:
+        return
+
+    body_radius = (CUBE_SIZE // 2) * CELL_SPACING + CELL_HALF * 1.45
+    height = 1.35 + 2.20 * heat
+    alpha_base = 0.08 + 0.32 * heat
+
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glLineWidth(1.0 + 2.6 * heat)
+
+    for i in range(count):
+        frac = i / max(1, count)
+        angle = frac * math.tau + math.sin(t * 1.6 + i * 0.37) * 0.18
+        # Ring around the cube, with a few front/back wobble offsets so it does
+        # not read as a flat 2D halo after the world rotation.
+        r = body_radius * (0.74 + 0.38 * ((i * 37) % 11) / 10.0)
+        bx = player.origin.x + math.cos(angle) * r
+        bz = player.origin.z + math.sin(angle) * r
+        by = player.origin.y - body_radius * (0.85 + 0.20 * math.sin(i))
+        lick = height * (0.45 + 0.70 * ((i * 53) % 17) / 16.0)
+        wobble = 0.35 + 0.50 * heat
+        pulse = 0.5 + 0.5 * math.sin(t * (7.0 + (i % 5)) + i * 0.83)
+        alpha = alpha_base * (0.45 + 0.55 * pulse)
+
+        glBegin(GL_LINE_STRIP)
+        glColor4f(1.0, 0.08, 0.01, alpha * 0.58)
+        glVertex3f(bx, by, bz)
+        glColor4f(1.0, 0.34 + 0.28 * pulse, 0.03, alpha)
+        glVertex3f(
+            bx + math.sin(t * 6.0 + i) * wobble,
+            by + lick * 0.48,
+            bz + math.cos(t * 5.3 + i * 1.7) * wobble,
+        )
+        glColor4f(1.0, 0.82, 0.18, alpha * 0.42)
+        glVertex3f(
+            bx + math.sin(t * 9.0 + i * 0.5) * wobble * 0.55,
+            by + lick,
+            bz + math.cos(t * 8.1 + i * 0.6) * wobble * 0.55,
+        )
+        glEnd()
+
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDisable(GL_BLEND)
+
+
+def player_thermal_tint(base_color, t: float):
+    """Return cube tint/outline for boundary overheat and cooldown.
+
+    Outside too long: normal palette -> pulsing red/orange/white hot.
+    Back inside: red heat drops, blue/cyan cooldown fades back to normal.
+    """
+    heat = clamp(BOUNDARY_HEAT_VISUAL, 0.0, 1.0)
+    cool = clamp(BOUNDARY_COOL_VISUAL, 0.0, 1.0)
+    outline = None
+    tinted = base_color
+
+    if heat > 0.005:
+        pulse = 0.5 + 0.5 * math.sin(t * math.tau * (5.0 + 5.5 * heat))
+        ember = (1.0, 0.04 + 0.30 * pulse, 0.008)
+        white_hot = (1.0, 0.88, 0.32)
+        hot = tuple(ember[i] * (1.0 - 0.42 * pulse * heat) + white_hot[i] * (0.42 * pulse * heat) for i in range(3))
+        # Stronger than the first pass: when OVERHEATING is on-screen, the cube
+        # should unmistakably read red-hot even under the rotating scene lights.
+        mix = clamp((0.48 + 0.48 * heat) * (0.82 + 0.18 * pulse), 0.0, 0.97)
+        tinted = tuple(base_color[i] * (1.0 - mix) + hot[i] * mix for i in range(3))
+        outline = (1.0, 0.32 + 0.55 * pulse, 0.04)
+    elif cool > 0.005:
+        pulse = 0.5 + 0.5 * math.sin(t * math.tau * 2.4)
+        coolant = (0.14, 0.48 + 0.25 * pulse, 1.0)
+        mix = clamp((0.12 + 0.52 * cool) * (0.88 + 0.12 * pulse), 0.0, 0.72)
+        tinted = tuple(base_color[i] * (1.0 - mix) + coolant[i] * mix for i in range(3))
+        outline = (0.28, 0.68, 1.0) if cool > 0.18 else None
+
+    return tinted, outline
+
+
 def player_flash_tint(base_color, t: float):
+    tinted, outline = player_thermal_tint(base_color, t)
     if CUBE_IMPACT_FLASH_TIMER <= 0.0:
-        return base_color, None
+        return tinted, outline
     life = clamp(CUBE_IMPACT_FLASH_TIMER / max(0.001, CUBE_IMPACT_FLASH_LIFETIME), 0.0, 1.0)
     strobe = 0.5 + 0.5 * math.sin(t * math.tau * CUBE_IMPACT_FLASH_HZ)
     hot = tuple(CUBE_IMPACT_FLASH_COLOR[i] * (1.0 - strobe) + 1.0 * strobe for i in range(3))
     mix = clamp((0.28 + 0.55 * strobe) * life, 0.0, 0.88)
-    tinted = tuple(base_color[i] * (1.0 - mix) + hot[i] * mix for i in range(3))
-    outline = (1.0, 1.0, 1.0) if strobe > 0.62 else None
+    tinted = tuple(tinted[i] * (1.0 - mix) + hot[i] * mix for i in range(3))
+    if strobe > 0.62:
+        outline = (1.0, 1.0, 1.0)
     return tinted, outline
 
 
@@ -6295,7 +6471,7 @@ def damage_from_lasers(player: PlayerCube, t: float):
     return destroyed
 
 
-def damage_from_bounds(player: PlayerCube):
+def damage_from_bounds(player: PlayerCube, overheat_level: float = 0.0):
     if (not debug_flag_enabled("damage", True) or
             not debug_flag_enabled("bounds", True) or
             debug_flag_enabled("noclip", False)):
@@ -6321,9 +6497,17 @@ def damage_from_bounds(player: PlayerCube):
         set_message("FIELD EDGE: RETURN TO COURSE", 0.7)
         return 0
 
+    overheat_level = clamp(overheat_level, 0.0, 1.0)
+    damage_multiplier = 1.0 + (max(1.0, BOUNDARY_OVERHEAT_MAX_DAMAGE_MULTIPLIER) - 1.0) * overheat_level
+    # Use floor, not ceil. With MAX_DAMAGE_PER_EVENT=2 and a mild x1.10-1.20
+    # multiplier, ceil() jumped to 3 cubes/event, which is an accidental +50%
+    # chunk-size spike. Overheat acceleration should mostly come from the shorter
+    # cooldown below, not sudden guillotine bites.
+    max_damage_this_event = max(1, int(math.floor(MAX_DAMAGE_PER_EVENT * damage_multiplier)))
+
     destroyed = 0
     blast_center = player.origin
-    for cell in victims[:min(MAX_DAMAGE_PER_EVENT, max_destroy_allowed)]:
+    for cell in victims[:min(max_damage_this_event, max_destroy_allowed)]:
         hit_pos = player.cell_world_pos(cell)
         normal = (hit_pos - player.origin).normalized()
         if player.destroy_cell(cell, blast_center):
@@ -6333,6 +6517,8 @@ def damage_from_bounds(player: PlayerCube):
         trigger_hit_effects(destroyed)
         if not BOUNDARY_DAMAGE_CAN_KILL and len(player.alive_cells) <= max(0, int(BOUNDARY_DAMAGE_MIN_SURVIVORS)):
             set_message("FIELD EDGE: CORE MERCY", 0.7)
+        elif overheat_level > 0.0:
+            set_message(f"OVERHEATING: -{destroyed} cubes", 0.7)
         else:
             set_message(f"FIELD EDGE: -{destroyed} cubes", 0.7)
     return destroyed
@@ -6584,22 +6770,42 @@ def render_time_counter(t: float, seconds_left: float):
     draw_surface_2d(surf, DISPLAY[0] - w / 2 - 18, 28 + h / 2)
 
 
-def render_danger_out_of_bounds(t: float):
+def render_danger_out_of_bounds(t: float, outside_seconds: float = 0.0, overheat_level: float = 0.0):
     # Amiga-ish raster warning: large outlined red text at top center.
-    blink = 0.5 + 0.5 * math.sin(t * math.tau * 5.0)
-    if blink < 0.18:
+    overheated = outside_seconds >= BOUNDARY_OVERHEAT_SECONDS
+    blink_hz = 7.2 if overheated else 5.0
+    blink = 0.5 + 0.5 * math.sin(t * math.tau * blink_hz)
+    if blink < (0.08 if overheated else 0.18):
         return
+
     font = get_font(42, True)
+    sub_font = get_font(30, True)
+    tiny = get_font(14, True)
     label = "DANGER!  OUT OF BOUNDS!"
+    surf = pygame.Surface((820, 124 if overheated else 88), pygame.SRCALPHA)
+
     # Fake raster: stack a couple of offset red/orange passes with black outline.
-    surf = pygame.Surface((720, 74), pygame.SRCALPHA)
     for yoff, col in ((4, (80, 0, 0)), (2, (210, 25, 10)), (0, (255, 220, 90))):
         txt = render_outlined_text(font, label, col, (0, 0, 0), width=3)
-        surf.blit(txt, ((surf.get_width() - txt.get_width()) // 2, 10 + yoff))
+        surf.blit(txt, ((surf.get_width() - txt.get_width()) // 2, 7 + yoff))
+
+    if overheated:
+        pulse = 0.5 + 0.5 * math.sin(t * math.tau * (8.0 + 4.0 * overheat_level))
+        over_col = (255, int(36 + 92 * pulse), 18)
+        over = render_outlined_text(sub_font, "OVERHEATING!", over_col, (0, 0, 0), width=3)
+        surf.blit(over, ((surf.get_width() - over.get_width()) // 2, 61))
+        accel = max(1.0, BOUNDARY_OVERHEAT_DECAY_ACCELERATION)
+        sub = render_outlined_text(tiny, f"BOUNDARY DECAY x{accel:.1f}  -  RE-ENTER TO COOL", (255, 185, 110), (0, 0, 0), width=2)
+        surf.blit(sub, ((surf.get_width() - sub.get_width()) // 2, 98))
+    else:
+        remaining = max(0.0, BOUNDARY_OVERHEAT_SECONDS - outside_seconds)
+        sub = render_outlined_text(tiny, f"THERMAL LIMIT IN {remaining:0.1f}s", (255, 200, 130), (0, 0, 0), width=2)
+        surf.blit(sub, ((surf.get_width() - sub.get_width()) // 2, 67))
+
     # scanline cuts
     for yy in range(0, surf.get_height(), 4):
         pygame.draw.line(surf, (0, 0, 0, 55), (0, yy), (surf.get_width(), yy))
-    draw_surface_2d(surf, DISPLAY[0] // 2, 58)
+    draw_surface_2d(surf, DISPLAY[0] // 2, 62 if overheated else 58)
 
 
 def render_pause_overlay(t: float, locate_enabled: bool):
@@ -7474,6 +7680,9 @@ def main():
     time_intro_timer = 0.0
     timed_leg_timer = TIME_PER_LEG_SECONDS
     timed_current_module = 0
+    boundary_outside_timer = 0.0
+    boundary_cool_timer = 0.0
+    boundary_last_heat_level = 0.0
 
     # Small explicit state machine. This prevents title, level ready, course materialization,
     # death/white-void reassembly, portal warp, input and scoring overlays from stomping on
@@ -7555,6 +7764,43 @@ def main():
     def recoverable_loose_fragment_count() -> int:
         return sum(1 for f in player.fragments if f.alive and f.expiry_remaining > 0.05)
 
+    def reset_boundary_thermal_runtime():
+        nonlocal boundary_outside_timer, boundary_cool_timer, boundary_last_heat_level
+        boundary_outside_timer = 0.0
+        boundary_cool_timer = 0.0
+        boundary_last_heat_level = 0.0
+        set_boundary_thermal_visual(0.0, 0.0)
+
+    def update_boundary_thermal_runtime(outside_now: bool, dt_value: float) -> float:
+        """Update out-of-bounds thermal state and return current overheat level."""
+        nonlocal boundary_outside_timer, boundary_cool_timer, boundary_last_heat_level
+        if outside_now:
+            boundary_outside_timer += dt_value
+            overheat = smoothstep((boundary_outside_timer - BOUNDARY_OVERHEAT_SECONDS) / max(0.001, BOUNDARY_OVERHEAT_RAMP_SECONDS))
+            boundary_last_heat_level = max(boundary_last_heat_level, overheat)
+            boundary_cool_timer = 0.0
+            # Gameplay heat can ramp gently from 0, but the visual should pop as
+            # soon as OVERHEATING starts so it is readable. Otherwise the text can
+            # be active while the cube still looks normal for the first ramp frames.
+            visual_heat = 0.0
+            if boundary_outside_timer >= BOUNDARY_OVERHEAT_SECONDS:
+                visual_heat = max(BOUNDARY_OVERHEAT_VISUAL_MIN_HEAT, overheat)
+            set_boundary_thermal_visual(visual_heat, 0.0)
+            return overheat
+
+        # Once safely back inside, snap out of red heat and cool blue back to normal.
+        if boundary_outside_timer > 0.0 and boundary_last_heat_level > 0.01:
+            boundary_cool_timer = max(boundary_cool_timer, BOUNDARY_OVERHEAT_COOL_SECONDS * boundary_last_heat_level)
+        boundary_outside_timer = 0.0
+        boundary_last_heat_level = 0.0
+        if boundary_cool_timer > 0.0:
+            boundary_cool_timer = max(0.0, boundary_cool_timer - dt_value)
+            cool = smoothstep(boundary_cool_timer / max(0.001, BOUNDARY_OVERHEAT_COOL_SECONDS))
+            set_boundary_thermal_visual(0.0, cool)
+        else:
+            set_boundary_thermal_visual(0.0, 0.0)
+        return 0.0
+
     def request_recoupling_or_cooldown() -> bool:
         """Consume re-coupling request quota when the C press actually matters.
 
@@ -7579,6 +7825,7 @@ def main():
         setup_level_geometry(current_level)
         timed_leg_timer = TIME_PER_LEG_SECONDS
         timed_current_module = 0
+        reset_boundary_thermal_runtime()
         reset_recoupling_quota()
         highest_level = max(highest_level, current_level)
         save_score_stats(best_escape, highest_level)
@@ -7599,6 +7846,7 @@ def main():
         nonlocal game_state, death_timer, course_materialize_timer, portal_warp_timer, win_overlay_timer, damage_timer, reassembly_particles, recoupling_particles, recoupling_timer, recoupling_notice_timer
         player.reset()
         clear_level_runtime_effects(clear_impact_particles=True)
+        reset_boundary_thermal_runtime()
         reassembly_particles = []
         recoupling_particles = []
         recoupling_timer = 0.0
@@ -8355,6 +8603,8 @@ def main():
                     set_message("RE-COUPLING FAILED", 0.65)
 
         # State-specific update.
+        outside_bounds_now = False
+        boundary_overheat_level = 0.0
         if game_state in ("title", "quit_confirm"):
             pass
 
@@ -8385,6 +8635,7 @@ def main():
                 if current_level >= TIME_MODE_START_LEVEL:
                     timed_leg_timer = TIME_PER_LEG_SECONDS
                     timed_current_module = 0
+                reset_boundary_thermal_runtime()
                 game_state = "playing"
                 damage_timer = 0.45
                 set_message(f"LEVEL {current_level}", 0.9)
@@ -8397,6 +8648,9 @@ def main():
             else:
                 handle_input(player, dt)
                 update_collapse_triggers(player, t)
+
+                outside_bounds_now = player_has_out_of_bounds_cells(player)
+                boundary_overheat_level = update_boundary_thermal_runtime(outside_bounds_now, dt)
 
                 if current_level >= TIME_MODE_START_LEVEL:
                     active_idx, _active_lx = player_module_location(player)
@@ -8420,11 +8674,18 @@ def main():
 
                 damage_timer -= dt
                 if damage_timer <= 0.0 and player.intact_count() > 0:
+                    hit_source = None
                     hit_count = damage_from_lasers(player, t)
-                    if hit_count == 0:
-                        hit_count = damage_from_bounds(player)
+                    if hit_count:
+                        hit_source = "laser"
+                    else:
+                        hit_count = damage_from_bounds(player, boundary_overheat_level)
+                        if hit_count:
+                            hit_source = "bounds"
                     if hit_count:
                         damage_timer = DAMAGE_COOLDOWN
+                        if hit_source == "bounds" and boundary_overheat_level > 0.0:
+                            damage_timer = DAMAGE_COOLDOWN / max(1.0, BOUNDARY_OVERHEAT_DECAY_ACCELERATION)
 
             if player.intact_count() <= 0:
                 recoupling_particles = []
@@ -8478,6 +8739,7 @@ def main():
                 setup_level_geometry(current_level)
                 clear_level_runtime_effects(clear_impact_particles=True)
                 reset_recoupling_quota()
+                reset_boundary_thermal_runtime()
                 # Timed mode is per attempt/leg. If death happens from timer collapse
                 # or inside a timed section, restart the level attempt with a fresh
                 # first-leg clock instead of re-entering play with the old zero/near-zero
@@ -8569,7 +8831,7 @@ def main():
                         if game_state == "playing" and current_level >= TIME_MODE_START_LEVEL:
                             render_time_counter(t, timed_leg_timer)
                         if player_has_out_of_bounds_cells(player):
-                            render_danger_out_of_bounds(t)
+                            render_danger_out_of_bounds(t, boundary_outside_timer, BOUNDARY_HEAT_VISUAL)
                         render_recoupling_notice(
                             t,
                             clamp(recoupling_timer / max(0.001, RECOUPLING_SECONDS), 0.0, 1.0) if recoupling_particles else 0.0,
