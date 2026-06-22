@@ -1,10 +1,14 @@
 # Cube Libre
 
+![Cube Libre title screen](assets/screenshots/cube_libre_title.png)
+
 **Cube Libre** is a cubistic Pygame/OpenGL survival-puzzle prototype by **FlyingFathead**.
 
 You control a cube made of smaller cubes. The cube is your body, health, cargo, score, and failure state. Rotating laser grids and boundary cages shear pieces away. Lost cubes can briefly be re-coupled, but recovery is lossy, time-limited, and rate-limited. The maze expands into modular pipe sections, collapses behind you, and eventually introduces time pressure.
 
 This is still an experimental prototype, not a polished release. Expect weirdness, sudden design shifts, and some very deliberate hostility.
+
+![Cube Libre gameplay](assets/screenshots/cube_libre_game_3.jpg)
 
 ## Current concept
 
@@ -29,6 +33,8 @@ Still a WIP.
 Longer-term design direction: some later gates may require the player to be damaged or reduced to fit through tight spaces. Staying whole is valuable, but being whole may not always be compatible with passage.
 
 This game prototype is based on (my previous OpenGL cube demo tests from 2024)[https://github.com/FlyingFathead/pygame-opengl-cube-demos/].
+
+![Cube Libre gameplay](assets/screenshots/cube_libre_game_2.jpg)
 
 ## Requirements
 
@@ -61,6 +67,8 @@ python cube_libre_recouple_gather_rate.py
 ```
 
 The game generates procedural sound files on first run under a local sound/effects directory. This first run may take slightly longer depending on the current prototype branch.
+
+![Cube Libre gameplay](assets/screenshots/cube_libre_game.jpg)
 
 ## Controls
 

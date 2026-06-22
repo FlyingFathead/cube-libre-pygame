@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+#
 # "Cube Libre" - rotating-field fixed prototype
 #
 # A cubistic puzzle/adventure game where the player is a cube made of smaller cubes.
@@ -10,7 +12,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.48-recouple-gather-rate"
+version_number = "0.15.49-no-accidental-level1-reset"
 
 import colorsys
 import json
@@ -45,6 +47,12 @@ PLAYER_CENTER_ZOOM = 48.0
 # small preview window ahead and let the rest materialize/reveal later. Stars are
 # deliberately left alone; the draw-call tax is mostly geometry, not 900 points.
 PREVIEW_MODULES_AHEAD = 1
+
+# Reset safety. Plain R used to restart the whole run from level 1, which is
+# too easy to hit accidentally while playing near E/D/Q/W. During an active
+# run, require Ctrl+R for the destructive full-run reset. Title/result screens
+# can still start/reset normally.
+RUN_RESET_REQUIRES_CTRL_DURING_PLAY = True
 
 CUBE_SIZE = 5                 # odd number; 5 -> local coords -2..2 on each axis
 CELL_SPACING = 1.0
@@ -1059,7 +1067,7 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
 
     lines = [
         (small.render("A/D or ←/→: move X    W/S or ↑/↓: move Y", True, (210, 235, 240)), 12),
-        (small.render("Q/E: move Z    Hold Shift for rush    R = reset run    M = mute", True, (210, 235, 240)), 38),
+        (small.render("Q/E: move Z    Hold Shift for rush    Ctrl+R = reset run    M = mute", True, (210, 235, 240)), 38),
         (tiny.render("Alt+F / F11 / Alt+Enter = fullscreen    H = help overlay", True, (178, 222, 230)), 66),
         (stat.render(f"Score: {score}     Best escape: {best_escape}/{MAX_CELLS} cubes     Highest level: {highest_level}", True, (165, 205, 218)), 89),
     ]
@@ -5871,9 +5879,18 @@ def main():
                         set_message("RE-COUPLING UNAVAILABLE", 0.55)
 
                 elif event.key == pygame.K_r:
-                    # Keep R as an explicit full-run reset/debug key, but it starts from
-                    # level 1 and zeroes the run score instead of preserving progress.
-                    start_new_run("RESET RUN")
+                    # Keep R as an explicit full-run reset/debug key, but do not let
+                    # an accidental R tap during active play throw a level 6 run back
+                    # to level 1. In active states, Ctrl+R is required.
+                    active_run_states = (
+                        "level_ready", "time_intro", "course_materialize", "playing",
+                        "death_dissolve", "reassembly", "reassembly_flash", "portal_warp",
+                    )
+                    ctrl_down = bool(mods & pygame.KMOD_CTRL)
+                    if RUN_RESET_REQUIRES_CTRL_DURING_PLAY and game_state in active_run_states and not ctrl_down:
+                        set_message("CTRL+R = RESET RUN", 0.85)
+                    else:
+                        start_new_run("RESET RUN")
 
         # Timers/effects always update.
         player.update_fragments(dt)
@@ -6142,7 +6159,7 @@ def main():
             pygame.display.set_caption(
                 f"Cube Libre v.{version_number} | state: {game_state} | level: {current_level} | intact: {player.intact_count():3d}/{MAX_CELLS} | "
                 f"score: {score} | best: {best_escape}/{MAX_CELLS} | highest level: {highest_level} | "
-                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc title/quit confirm | H help | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, R reset{msg}"
+                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc title/quit confirm | H help | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset{msg}"
             )
             caption_timer = 0.12
 
