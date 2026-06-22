@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.72-preview timer fix"
+version_number = "0.15.74-bounds zero death"
 
 import colorsys
 import importlib.util
@@ -303,6 +303,13 @@ SPACE_INTRO_FADE_IN_SECONDS = 1.10
 TUNNEL_HALF = max(abs(COURSE_Z_MIN), abs(COURSE_Z_MAX))
 TURN_JOINT_HALF = TUNNEL_HALF
 BOUNDARY_DAMAGE_PAD = 0.25
+# Boundary/cage hits shave protruding cells. They are allowed to finish the run
+# only by reducing the controlled body to zero cells, so death still follows the
+# normal zero-integrity path instead of a separate instant out-of-bounds nuke.
+# Set BOUNDARY_DAMAGE_MIN_SURVIVORS to 1 for non-lethal bumper mode. Default 0
+# means: no cubes left = you die, as expected.
+BOUNDARY_DAMAGE_CAN_KILL = True
+BOUNDARY_DAMAGE_MIN_SURVIVORS = 0
 # Small laser mercy only inside the actual same-size joint cube. This prevents
 # seam shaving without deleting obstacle grids from the corridor modules.
 TURN_JOINT_LASER_PAD = 0.0
@@ -3302,10 +3309,13 @@ def turn_joint_index_for_point(p: Vec3, pad: float = 0.0):
     The index is the joint between module index and index + 1. Used for
     progressive reveal/culling only; controls stay world-axis based.
     """
+    # This must be centered on the actual 3D joint. The older version checked
+    # world Y against COURSE_Y_MIN/MAX, which worked for the first flat X/Z bend
+    # but missed vertical-axis joints whose center.y is far away from zero.
     h = TURN_JOINT_HALF + pad
     for idx, (center, _open_faces) in enumerate(turn_chamber_joints()):
         if (center.x - h <= p.x <= center.x + h and
-                COURSE_Y_MIN - pad <= p.y <= COURSE_Y_MAX + pad and
+                center.y - h <= p.y <= center.y + h and
                 center.z - h <= p.z <= center.z + h):
             return idx
     return None
@@ -6301,9 +6311,19 @@ def damage_from_bounds(player: PlayerCube):
     if not victims:
         return 0
 
+    # This is not a separate out-of-bounds death switch. It only removes cells.
+    # If that reaches zero, the main update loop enters the normal death/rebuild
+    # state. Optional bumper mode can reserve one or more survivor cells.
+    survivor_floor = 0 if BOUNDARY_DAMAGE_CAN_KILL else max(0, int(BOUNDARY_DAMAGE_MIN_SURVIVORS))
+    max_destroy_allowed = max(0, len(player.alive_cells) - survivor_floor)
+
+    if max_destroy_allowed <= 0:
+        set_message("FIELD EDGE: RETURN TO COURSE", 0.7)
+        return 0
+
     destroyed = 0
     blast_center = player.origin
-    for cell in victims[:MAX_DAMAGE_PER_EVENT]:
+    for cell in victims[:min(MAX_DAMAGE_PER_EVENT, max_destroy_allowed)]:
         hit_pos = player.cell_world_pos(cell)
         normal = (hit_pos - player.origin).normalized()
         if player.destroy_cell(cell, blast_center):
@@ -6311,7 +6331,10 @@ def damage_from_bounds(player: PlayerCube):
             spawn_bound_hit_effect(hit_pos, normal, destroyed)
     if destroyed:
         trigger_hit_effects(destroyed)
-        set_message(f"FIELD EDGE: -{destroyed} cubes", 0.7)
+        if not BOUNDARY_DAMAGE_CAN_KILL and len(player.alive_cells) <= max(0, int(BOUNDARY_DAMAGE_MIN_SURVIVORS)):
+            set_message("FIELD EDGE: CORE MERCY", 0.7)
+        else:
+            set_message(f"FIELD EDGE: -{destroyed} cubes", 0.7)
     return destroyed
 
 
