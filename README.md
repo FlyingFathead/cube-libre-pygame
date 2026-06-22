@@ -57,7 +57,7 @@ numpy
 From the repository root:
 
 ```bash
-python cube_libre.py
+python cube_libre_pygame.py
 ```
 
 If you are using a dated prototype file directly, run that file instead, for example:
