@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.69-reset-modfix"
+version_number = "0.15.70-perf-window"
 
 import colorsys
 import importlib.util
@@ -128,6 +128,18 @@ PLAYER_CENTER_ZOOM = 48.0
 # small preview window ahead and let the rest materialize/reveal later. Stars are
 # deliberately left alone; the draw-call tax is mostly geometry, not 900 points.
 PREVIEW_MODULES_AHEAD = 1
+# Performance ceiling: difficulty may keep increasing, but the physical route
+# should stop growing forever. Above this, later levels reuse a capped-length
+# course and increase danger through speed/timers/laser behavior instead of
+# making the renderer push a larger and larger intestinal tract.
+MAX_COURSE_MODULES = 7
+AUTO_CENTER_START_LEVEL = 3
+AUTO_CENTER_ON_HIGH_LEVELS = True
+RENDER_MODULES_BEHIND = 1
+RENDER_MODULES_AHEAD = 1
+LASER_MODULES_BEHIND = 1
+LASER_MODULES_AHEAD = 1
+MATERIALIZE_LASER_MODULES = 2
 
 # Reset safety / keybind. Plain R used to restart the whole run from level 1,
 # which is too easy to hit accidentally while playing near E/D/Q/W. Keep the
@@ -313,6 +325,10 @@ TRAIL_FADE_SECONDS_AT_RUSH = 1.0
 TRAIL_FADE_DISTANCE = MOVE_SPEED * FAST_MULT * TRAIL_FADE_SECONDS_AT_RUSH
 TRAIL_FLASH_HZ = 11.0
 COLLAPSE_DEBRIS_COUNT = 70
+# Hard caps for transient local effects. Impact/collapse particles are visual
+# sugar; they must never be allowed to become the real boss fight.
+MAX_IMPACT_SPARKS = 300
+MAX_IMPACT_GLOWS = 80
 # Once a collapse starts, keep the visible eat-away effect time-based. The old
 # distance-only fade could vanish too subtly or draw the curtain at the wrong
 # joint, especially after the portal/commit changes.
@@ -2621,6 +2637,7 @@ class CourseModule:
 COURSE_MODULES = []
 PORTAL_MODULE = None
 ACTIVE_LEVEL = 1
+COURSE_RENDER_CACHE = {"modules": {}, "joints": {}}
 
 
 def _route_dir_key(direction):
@@ -2800,6 +2817,16 @@ def make_course_directions_for_level(level: int):
     return tuple(directions)
 
 
+def course_module_count_for_level(level: int) -> int:
+    """Physical route length for a difficulty level.
+
+    Level number remains the difficulty/scoring value. The actual generated
+    route is capped so level 10+ does not linearly multiply modules, joints and
+    laser grids forever.
+    """
+    return min(MAX_COURSE_MODULES, max(1, int(level)))
+
+
 def make_course_modules(level: int):
     level = max(1, int(level))
     modules = []
@@ -2851,7 +2878,7 @@ def setup_level_geometry(level: int):
     LASER_REVEAL_AT = {}
     LASER_REVEAL_SOUND_PLAYED = set()
     ACTIVE_LEVEL = max(1, int(level))
-    COURSE_MODULES = make_course_modules(ACTIVE_LEVEL)
+    COURSE_MODULES = make_course_modules(course_module_count_for_level(ACTIVE_LEVEL))
     PORTAL_MODULE = COURSE_MODULES[-1]
     portal_world = PORTAL_MODULE.local_to_world(PORTAL_LOCAL_X, 0.0, 0.0)
     PORTAL_POSITION = portal_world.as_tuple()
@@ -2868,6 +2895,7 @@ def setup_level_geometry(level: int):
         LASER_REVEAL_AT = {module.index: -9999.0 for module in COURSE_MODULES}
     else:
         LASER_REVEAL_AT = {0: -9999.0}
+    build_course_render_cache()
 
 
 def module_has_prev_turn(module: CourseModule) -> bool:
@@ -3085,6 +3113,48 @@ def all_course_guide_segments():
     segs = [seg for module in COURSE_MODULES for seg in module_guide_segments(module)]
     segs.extend(all_turn_chamber_face_grid_segments())
     return segs
+
+
+def build_course_render_cache():
+    """Precompute static line geometry for the current level.
+
+    The old draw path rebuilt module/joint segment lists every frame. That is
+    harmless on level 1, but wasteful once the course has several turned
+    modules. The cache is rebuilt only when setup_level_geometry() changes the
+    route.
+    """
+    global COURSE_RENDER_CACHE
+    module_cache = {}
+    for module in COURSE_MODULES:
+        module_cache[module.index] = {
+            "box": module_box_segments(module),
+            "guide": module_guide_segments(module),
+        }
+
+    joint_cache = {}
+    for idx, (center, open_faces) in enumerate(turn_chamber_joints()):
+        joint_cache[idx] = {
+            "box": turn_chamber_segments(center),
+            "guide": turn_chamber_face_grid_segments(center, open_faces),
+        }
+
+    COURSE_RENDER_CACHE = {"modules": module_cache, "joints": joint_cache}
+
+
+def cached_module_box_segments(module: CourseModule):
+    return COURSE_RENDER_CACHE.get("modules", {}).get(module.index, {}).get("box", module_box_segments(module))
+
+
+def cached_module_guide_segments(module: CourseModule):
+    return COURSE_RENDER_CACHE.get("modules", {}).get(module.index, {}).get("guide", module_guide_segments(module))
+
+
+def cached_joint_box_segments(joint_index: int, center: Vec3):
+    return COURSE_RENDER_CACHE.get("joints", {}).get(joint_index, {}).get("box", turn_chamber_segments(center))
+
+
+def cached_joint_guide_segments(joint_index: int, center: Vec3, open_faces):
+    return COURSE_RENDER_CACHE.get("joints", {}).get(joint_index, {}).get("guide", turn_chamber_face_grid_segments(center, open_faces))
 
 
 def point_inside_course(p: Vec3, pad: float = 0.0) -> bool:
@@ -3335,26 +3405,83 @@ def _trail_flash(alpha: float, t: float, salt: float = 0.0) -> float:
     return clamp(alpha * flash, 0.0, 1.0)
 
 
-def module_trail_alpha(module: CourseModule, player: "PlayerCube", t: float) -> float:
+def course_render_window(player: "PlayerCube" = None):
+    """Small per-frame visibility/collision window around the player.
+
+    This is the central anti-mushrooming gate: draw/collision code should ask
+    this once, then ignore modules and lasers outside the returned index ranges.
+    """
+    n = len(COURSE_MODULES)
+    if n <= 0:
+        return {
+            "active_idx": 0, "active_lx": COURSE_X_MIN, "reveal_idx": 0,
+            "module_min": 0, "module_max": -1, "joint_min": 0, "joint_max": -1,
+            "laser_min": 0, "laser_max": -1,
+        }
+
+    if player is None or ACTIVE_LEVEL < PREVIEW_CULL_START_LEVEL:
+        return {
+            "active_idx": 0, "active_lx": COURSE_X_MIN, "reveal_idx": n - 1,
+            "module_min": 0, "module_max": n - 1,
+            "joint_min": 0, "joint_max": max(-1, n - 2),
+            "laser_min": 0, "laser_max": n - 1,
+        }
+
     active_idx, active_lx = player_module_location(player)
+    reveal_idx = reveal_module_index_for_player(player)
+
+    module_min = max(0, active_idx - RENDER_MODULES_BEHIND)
+    module_max = min(n - 1, max(active_idx + RENDER_MODULES_AHEAD, reveal_idx + PREVIEW_MODULES_AHEAD))
+    joint_min = max(0, module_min - 1)
+    joint_max = min(n - 2, module_max)
+    laser_min = max(0, active_idx - LASER_MODULES_BEHIND)
+    laser_max = min(n - 1, max(active_idx + LASER_MODULES_AHEAD, reveal_idx + LASER_MODULES_AHEAD))
+
+    return {
+        "active_idx": active_idx, "active_lx": active_lx, "reveal_idx": reveal_idx,
+        "module_min": module_min, "module_max": module_max,
+        "joint_min": joint_min, "joint_max": joint_max,
+        "laser_min": laser_min, "laser_max": laser_max,
+    }
+
+
+def module_trail_alpha_for_location(module: CourseModule, active_idx: int, active_lx: float, t: float) -> float:
     fade = _trail_combined_fade(active_idx, active_lx, module.index, t)
     return _trail_flash(1.0 - fade, t, module.index * 0.137)
 
 
-def joint_trail_alpha(joint_index: int, player: "PlayerCube", t: float) -> float:
+def module_trail_alpha(module: CourseModule, player: "PlayerCube", t: float) -> float:
     active_idx, active_lx = player_module_location(player)
+    return module_trail_alpha_for_location(module, active_idx, active_lx, t)
+
+
+def joint_trail_alpha_for_location(joint_index: int, active_idx: int, active_lx: float, t: float) -> float:
     fade = _trail_combined_fade(active_idx, active_lx, joint_index, t)
     return _trail_flash(1.0 - fade, t, joint_index * 0.219 + 0.31)
 
 
-def laser_trail_fade(laser: LaserGrid, player: "PlayerCube", t: float) -> float:
+def joint_trail_alpha(joint_index: int, player: "PlayerCube", t: float) -> float:
     active_idx, active_lx = player_module_location(player)
+    return joint_trail_alpha_for_location(joint_index, active_idx, active_lx, t)
+
+
+def laser_trail_fade_for_location(laser: LaserGrid, active_idx: int, active_lx: float, t: float) -> float:
     return _trail_combined_fade(active_idx, active_lx, getattr(laser, "module_index", 0), t)
 
 
-def laser_trail_alpha(laser: LaserGrid, player: "PlayerCube", t: float) -> float:
-    fade = laser_trail_fade(laser, player, t)
+def laser_trail_fade(laser: LaserGrid, player: "PlayerCube", t: float) -> float:
+    active_idx, active_lx = player_module_location(player)
+    return laser_trail_fade_for_location(laser, active_idx, active_lx, t)
+
+
+def laser_trail_alpha_for_location(laser: LaserGrid, active_idx: int, active_lx: float, t: float) -> float:
+    fade = laser_trail_fade_for_location(laser, active_idx, active_lx, t)
     return _trail_flash(1.0 - fade, t, getattr(laser, "module_index", 0) * 0.173 + 0.62)
+
+
+def laser_trail_alpha(laser: LaserGrid, player: "PlayerCube", t: float) -> float:
+    active_idx, active_lx = player_module_location(player)
+    return laser_trail_alpha_for_location(laser, active_idx, active_lx, t)
 
 
 def laser_should_be_hard_culled(laser: LaserGrid, player: "PlayerCube", t: float) -> bool:
@@ -3374,16 +3501,23 @@ def laser_should_be_hard_culled(laser: LaserGrid, player: "PlayerCube", t: float
     return _trail_fade_progress(active_idx, active_lx, module_idx) >= 0.995
 
 
-def laser_is_active_for_player(laser: LaserGrid, player: "PlayerCube", t: float = 0.0) -> bool:
+def laser_is_active_in_window(laser: LaserGrid, player: "PlayerCube", t: float, window) -> bool:
+    module_idx = getattr(laser, "module_index", 0)
+    if ACTIVE_LEVEL >= PREVIEW_CULL_START_LEVEL:
+        if module_idx < window["laser_min"] or module_idx > window["laser_max"]:
+            return False
+        if module_idx > window["reveal_idx"]:
+            return False
     if laser_should_be_hard_culled(laser, player, t):
-        return False
-    if not laser_is_revealed_for_player(laser, player):
         return False
     if not laser_reveal_collision_armed(laser, t):
         return False
-    active_idx, active_lx = player_module_location(player)
-    fade = _trail_fade_progress(active_idx, active_lx, getattr(laser, "module_index", 0))
+    fade = _trail_fade_progress(window["active_idx"], window["active_lx"], module_idx)
     return fade < 0.98
+
+
+def laser_is_active_for_player(laser: LaserGrid, player: "PlayerCube", t: float = 0.0) -> bool:
+    return laser_is_active_in_window(laser, player, t, course_render_window(player))
 
 
 def draw_future_laser_marker(laser: LaserGrid, t: float, alpha: float = 0.13):
@@ -3715,6 +3849,7 @@ def spawn_collapse_debris(center: Vec3, direction: Vec3, severity: int = 1):
             radius=TUNNEL_HALF * 1.22,
         )
     )
+    trim_impact_effects_to_caps()
 
 
 def update_collapse_triggers(player: "PlayerCube", t: float):
@@ -3756,23 +3891,23 @@ def player_inside_collapsing_section(player: "PlayerCube", t: float) -> bool:
 
 
 def draw_course_frame(player: "PlayerCube" = None, t: float = 0.0):
-    # Draw active modules normally, but from level 3 onward future modules are
-    # cheap grey plumbing previews until the player reaches the joint before them.
-    # This avoids rendering every future red grid / guide line while preserving
-    # the readable modular maze shape.
+    # Draw only the per-frame module window. From level 3 onward, this means:
+    # one recent module behind, the current module, and one preview/revealed
+    # module ahead. Everything else is logically still in the route, but not
+    # burning draw calls this frame.
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-    reveal_idx = len(COURSE_MODULES) - 1 if player is None else reveal_module_index_for_player(player)
+    window = course_render_window(player)
+    reveal_idx = window["reveal_idx"]
+    active_idx = window["active_idx"]
+    active_lx = window["active_lx"]
 
-    for module in COURSE_MODULES:
-        # Level 3+ performance cull: far-future modules are not rendered at all.
-        # The next couple of modules remain as grey plumbing preview; everything
-        # beyond that will appear once you move forward.
-        if (player is not None and ACTIVE_LEVEL >= PREVIEW_CULL_START_LEVEL and
-                module.index > reveal_idx + PREVIEW_MODULES_AHEAD):
+    for module_index in range(window["module_min"], window["module_max"] + 1):
+        if module_index < 0 or module_index >= len(COURSE_MODULES):
             continue
-        preview = player is not None and module_is_preview_only(module.index, player)
+        module = COURSE_MODULES[module_index]
+        preview = player is not None and ACTIVE_LEVEL >= PREVIEW_CULL_START_LEVEL and module.index > reveal_idx
         if preview:
             # Only the exterior tube outline: no internal guide grid, no red grids.
             far = max(0, module.index - reveal_idx)
@@ -3780,19 +3915,19 @@ def draw_course_frame(player: "PlayerCube" = None, t: float = 0.0):
             glColor4f(0.42, 0.44, 0.48, alpha)
             glLineWidth(0.9)
             glBegin(GL_LINES)
-            for a, b in module_box_segments(module):
+            for a, b in cached_module_box_segments(module):
                 glVertex3f(a.x, a.y, a.z)
                 glVertex3f(b.x, b.y, b.z)
             glEnd()
             continue
 
-        alpha = 1.0 if player is None else module_trail_alpha(module, player, t)
+        alpha = 1.0 if player is None else module_trail_alpha_for_location(module, active_idx, active_lx, t)
         if alpha <= 0.01:
             continue
         glColor4f(0.35, 0.75, 1.0, 0.45 * alpha)
         glLineWidth(1.1)
         glBegin(GL_LINES)
-        for a, b in module_box_segments(module):
+        for a, b in cached_module_box_segments(module):
             glVertex3f(a.x, a.y, a.z)
             glVertex3f(b.x, b.y, b.z)
         glEnd()
@@ -3800,16 +3935,17 @@ def draw_course_frame(player: "PlayerCube" = None, t: float = 0.0):
         glColor4f(0.35, 0.35, 0.50, 0.35 * alpha)
         glLineWidth(1.0)
         glBegin(GL_LINES)
-        for a, b in module_guide_segments(module):
+        for a, b in cached_module_guide_segments(module):
             glVertex3f(a.x, a.y, a.z)
             glVertex3f(b.x, b.y, b.z)
         glEnd()
 
     current_joint = None if player is None else turn_joint_index_for_point(player.origin, pad=CELL_SPACING * 1.2)
-    for joint_index, (center, open_faces) in enumerate(turn_chamber_joints()):
-        if (player is not None and ACTIVE_LEVEL >= PREVIEW_CULL_START_LEVEL and
-                joint_index > reveal_idx + PREVIEW_MODULES_AHEAD):
+    joints = turn_chamber_joints()
+    for joint_index in range(window["joint_min"], window["joint_max"] + 1):
+        if joint_index < 0 or joint_index >= len(joints):
             continue
+        center, open_faces = joints[joint_index]
         preview = (
             player is not None and ACTIVE_LEVEL >= PREVIEW_CULL_START_LEVEL and
             joint_index >= reveal_idx and current_joint != joint_index
@@ -3818,19 +3954,19 @@ def draw_course_frame(player: "PlayerCube" = None, t: float = 0.0):
             glColor4f(0.42, 0.44, 0.48, PREVIEW_WIREFRAME_ALPHA * 0.9)
             glLineWidth(0.9)
             glBegin(GL_LINES)
-            for a, b in turn_chamber_segments(center):
+            for a, b in cached_joint_box_segments(joint_index, center):
                 glVertex3f(a.x, a.y, a.z)
                 glVertex3f(b.x, b.y, b.z)
             glEnd()
             continue
 
-        alpha = 1.0 if player is None else joint_trail_alpha(joint_index, player, t)
+        alpha = 1.0 if player is None else joint_trail_alpha_for_location(joint_index, active_idx, active_lx, t)
         if alpha <= 0.01:
             continue
         glColor4f(0.35, 0.75, 1.0, 0.45 * alpha)
         glLineWidth(1.1)
         glBegin(GL_LINES)
-        for a, b in turn_chamber_segments(center):
+        for a, b in cached_joint_box_segments(joint_index, center):
             glVertex3f(a.x, a.y, a.z)
             glVertex3f(b.x, b.y, b.z)
         glEnd()
@@ -3838,7 +3974,7 @@ def draw_course_frame(player: "PlayerCube" = None, t: float = 0.0):
         glColor4f(0.35, 0.35, 0.50, 0.35 * alpha)
         glLineWidth(1.0)
         glBegin(GL_LINES)
-        for a, b in turn_chamber_face_grid_segments(center, open_faces):
+        for a, b in cached_joint_guide_segments(joint_index, center, open_faces):
             glVertex3f(a.x, a.y, a.z)
             glVertex3f(b.x, b.y, b.z)
         glEnd()
@@ -4205,6 +4341,13 @@ CUBE_IMPACT_FLASH_COLOR = (1.0, 0.08, 0.03)
 COLLAPSE_TRIGGERED = set()
 
 
+def trim_impact_effects_to_caps():
+    if MAX_IMPACT_SPARKS > 0 and len(IMPACT_SPARKS) > MAX_IMPACT_SPARKS:
+        del IMPACT_SPARKS[:len(IMPACT_SPARKS) - MAX_IMPACT_SPARKS]
+    if MAX_IMPACT_GLOWS > 0 and len(IMPACT_GLOWS) > MAX_IMPACT_GLOWS:
+        del IMPACT_GLOWS[:len(IMPACT_GLOWS) - MAX_IMPACT_GLOWS]
+
+
 def trigger_cube_impact_flash(color, seconds: float = CUBE_IMPACT_FLASH_SECONDS):
     """Flash the player cube in the same color family as the struck object.
 
@@ -4238,6 +4381,7 @@ def update_impact_effects(dt: float):
         glow.update(dt)
     IMPACT_SPARKS[:] = [spark for spark in IMPACT_SPARKS if spark.alive]
     IMPACT_GLOWS[:] = [glow for glow in IMPACT_GLOWS if glow.alive]
+    trim_impact_effects_to_caps()
     if CUBE_IMPACT_FLASH_TIMER > 0.0:
         CUBE_IMPACT_FLASH_TIMER = max(0.0, CUBE_IMPACT_FLASH_TIMER - dt)
 
@@ -4293,6 +4437,7 @@ def spawn_impact_sparks(pos: Vec3, base_color, normal: Vec3, count: int, speed_m
                 size=size * random.uniform(0.55, 1.10),
             )
         )
+    trim_impact_effects_to_caps()
 
 
 def spawn_laser_hit_effect(pos: Vec3, laser: LaserGrid, t: float, severity: int = 1):
@@ -4747,7 +4892,8 @@ def draw_course_materialization_scene(player: PlayerCube, t: float, scene_angles
     p = smoothstep(progress)
     draw_materializing_course_frame(clamp(p / 0.72, 0.0, 1.0), t)
 
-    for idx, laser in enumerate(LASERS):
+    materialize_lasers = [laser for laser in LASERS if getattr(laser, "module_index", 0) < MATERIALIZE_LASER_MODULES]
+    for idx, laser in enumerate(materialize_lasers):
         laser_p = clamp((p - 0.12 - idx * 0.065) / 0.58, 0.0, 1.0)
         draw_materializing_laser_grid(laser, t, laser_p)
 
@@ -5860,7 +6006,8 @@ def damage_from_lasers(player: PlayerCube, t: float):
     # state, and those helpers in turn call module-location logic. By level 4+
     # that became a Python-side tax even when most hazards were not actually
     # being drawn.
-    active_lasers = [laser for laser in LASERS if laser_is_active_for_player(laser, player, t)]
+    window = course_render_window(player)
+    active_lasers = [laser for laser in LASERS if laser_is_active_in_window(laser, player, t, window)]
     if not active_lasers:
         return 0
 
@@ -6969,33 +7116,27 @@ def draw_scene(player: PlayerCube, t: float, scene_angles, draw_player_body: boo
     draw_portal(t, portal_overlap_charge(player) if draw_player_body else 0.0)
     if draw_player_body:
         update_laser_reveal_state(player, t)
-    reveal_idx = reveal_module_index_for_player(player) if draw_player_body else len(COURSE_MODULES) - 1
-    active_idx = 0
-    if draw_player_body:
-        active_idx, _active_lx = player_module_location(player)
+    window = course_render_window(player if draw_player_body else None)
+    reveal_idx = window["reveal_idx"]
+    active_idx = window["active_idx"]
+    active_lx = window["active_lx"]
     for laser in LASERS:
         module_idx = getattr(laser, "module_index", 0)
         if draw_player_body and ACTIVE_LEVEL >= PREVIEW_CULL_START_LEVEL:
-            # Absolute hard cull: only keep the current module, one recent module
-            # behind, and the next revealed/preview module. The older condition
-            # kept TRAIL_KEEP_JOINTS+1 modules behind, which at level 5 could
-            # still leave almost the entire maze iterating/drawing ember states.
-            if module_idx < active_idx - 1:
-                continue
-            if module_idx > reveal_idx + 1:
+            if module_idx < window["laser_min"] or module_idx > window["laser_max"]:
                 continue
         if draw_player_body and laser_should_be_hard_culled(laser, player, t):
             continue
         if draw_player_body and ACTIVE_LEVEL >= PREVIEW_CULL_START_LEVEL and module_idx > reveal_idx:
             # Future hazards are only grey ghost-markers, not active rotating red grids.
             # This is the level-3+ culling win.
-            if module_idx <= reveal_idx + 1:
+            if module_idx <= window["laser_max"]:
                 draw_future_laser_marker(laser, t, PREVIEW_WIREFRAME_ALPHA * 0.55)
             continue
-        la = laser_trail_alpha(laser, player, t) if draw_player_body else 1.0
+        la = laser_trail_alpha_for_location(laser, active_idx, active_lx, t) if draw_player_body else 1.0
         if la > 0.01:
             if draw_player_body:
-                trail_fade = laser_trail_fade(laser, player, t)
+                trail_fade = laser_trail_fade_for_location(laser, active_idx, active_lx, t)
                 rp = laser_reveal_progress(module_idx, t)
                 if trail_fade > 0.025:
                     # Passed grids cool into embers/ash instead of staying as full red
@@ -8141,7 +8282,7 @@ def main():
                         draw_player_body=not hide_player,
                         recoupling_particles=recoupling_particles,
                         recoupling_progress=clamp(recoupling_timer / max(0.001, RECOUPLING_SECONDS), 0.0, 1.0),
-                        center_on_player=locate_camera_enabled,
+                        center_on_player=(locate_camera_enabled or (AUTO_CENTER_ON_HIGH_LEVELS and current_level >= AUTO_CENTER_START_LEVEL)),
                     )
 
                     if game_state == "death_dissolve":
