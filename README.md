@@ -32,7 +32,7 @@ Still a WIP.
 
 Longer-term design direction: some later gates may require the player to be damaged or reduced to fit through tight spaces. Staying whole is valuable, but being whole may not always be compatible with passage.
 
-This game prototype is based on (my previous OpenGL cube demo tests from 2024)[https://github.com/FlyingFathead/pygame-opengl-cube-demos/].
+This game prototype is based on [my previous OpenGL cube demo tests from 2024](https://github.com/FlyingFathead/pygame-opengl-cube-demos/).
 
 ![Cube Libre gameplay](assets/screenshots/cube_libre_game_2.jpg)
 
