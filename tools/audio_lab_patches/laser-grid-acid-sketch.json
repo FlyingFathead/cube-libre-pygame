@@ -1,0 +1,269 @@
+{
+  "version": 1,
+  "name": "laser-grid-acid-sketch",
+  "bpm": 128,
+  "swing": 0.0,
+  "steps": 32,
+  "rows": 24,
+  "base_midi": 48,
+  "step_beats": 0.25,
+  "loop": true,
+  "tracks": [
+    {
+      "name": "FM bite",
+      "muted": false,
+      "solo": false,
+      "params": {
+        "wave": "fm",
+        "gain": 0.42,
+        "attack": 0.006,
+        "decay": 0.045,
+        "sustain": 0.12,
+        "release": 0.09,
+        "fm_ratio": 3.0,
+        "fm_index": 5.5,
+        "noise": 0.0,
+        "detune": 0.0,
+        "pan": -0.35,
+        "cutoff": 0.8,
+        "drive": 0.3
+      },
+      "notes": [
+        {
+          "step": 0,
+          "midi": 60,
+          "length": 2,
+          "velocity": 0.85
+        },
+        {
+          "step": 4,
+          "midi": 63,
+          "length": 2,
+          "velocity": 0.7
+        },
+        {
+          "step": 8,
+          "midi": 67,
+          "length": 2,
+          "velocity": 0.8
+        },
+        {
+          "step": 12,
+          "midi": 70,
+          "length": 2,
+          "velocity": 0.65
+        },
+        {
+          "step": 16,
+          "midi": 60,
+          "length": 2,
+          "velocity": 0.85
+        },
+        {
+          "step": 20,
+          "midi": 65,
+          "length": 2,
+          "velocity": 0.72
+        },
+        {
+          "step": 24,
+          "midi": 67,
+          "length": 2,
+          "velocity": 0.8
+        },
+        {
+          "step": 28,
+          "midi": 72,
+          "length": 3,
+          "velocity": 0.7
+        }
+      ]
+    },
+    {
+      "name": "saw stab",
+      "muted": false,
+      "solo": false,
+      "params": {
+        "wave": "ring",
+        "gain": 0.28,
+        "attack": 0.006,
+        "decay": 0.08,
+        "sustain": 0.45,
+        "release": 0.18,
+        "fm_ratio": 1.5,
+        "fm_index": 0.8,
+        "noise": 0.0,
+        "detune": 0.0,
+        "pan": 0.45,
+        "cutoff": 0.8,
+        "drive": 0.1
+      },
+      "notes": [
+        {
+          "step": 0,
+          "midi": 36,
+          "length": 1,
+          "velocity": 0.6
+        },
+        {
+          "step": 4,
+          "midi": 36,
+          "length": 1,
+          "velocity": 0.6
+        },
+        {
+          "step": 8,
+          "midi": 41,
+          "length": 1,
+          "velocity": 0.6
+        },
+        {
+          "step": 12,
+          "midi": 41,
+          "length": 1,
+          "velocity": 0.6
+        },
+        {
+          "step": 16,
+          "midi": 46,
+          "length": 1,
+          "velocity": 0.6
+        },
+        {
+          "step": 20,
+          "midi": 46,
+          "length": 1,
+          "velocity": 0.6
+        },
+        {
+          "step": 24,
+          "midi": 51,
+          "length": 1,
+          "velocity": 0.6
+        },
+        {
+          "step": 28,
+          "midi": 51,
+          "length": 1,
+          "velocity": 0.6
+        }
+      ]
+    },
+    {
+      "name": "noise ash",
+      "muted": false,
+      "solo": false,
+      "params": {
+        "wave": "noise",
+        "gain": 0.18,
+        "attack": 0.001,
+        "decay": 0.02,
+        "sustain": 0.05,
+        "release": 0.05,
+        "fm_ratio": 3.0,
+        "fm_index": 0.8,
+        "noise": 0.75,
+        "detune": 0.0,
+        "pan": 0.0,
+        "cutoff": 0.35,
+        "drive": 0.1
+      },
+      "notes": [
+        {
+          "step": 2,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        },
+        {
+          "step": 6,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        },
+        {
+          "step": 10,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        },
+        {
+          "step": 14,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        },
+        {
+          "step": 18,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        },
+        {
+          "step": 22,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        },
+        {
+          "step": 26,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        },
+        {
+          "step": 30,
+          "midi": 72,
+          "length": 1,
+          "velocity": 0.45
+        }
+      ]
+    },
+    {
+      "name": "tri pulse",
+      "muted": false,
+      "solo": false,
+      "params": {
+        "wave": "pluck",
+        "gain": 0.3,
+        "attack": 0.006,
+        "decay": 0.08,
+        "sustain": 0.45,
+        "release": 0.55,
+        "fm_ratio": 3.5,
+        "fm_index": 0.8,
+        "noise": 0.0,
+        "detune": 0.0,
+        "pan": -0.2,
+        "cutoff": 0.8,
+        "drive": 0.1
+      },
+      "notes": [
+        {
+          "step": 0,
+          "midi": 48,
+          "length": 4,
+          "velocity": 0.45
+        },
+        {
+          "step": 8,
+          "midi": 48,
+          "length": 4,
+          "velocity": 0.45
+        },
+        {
+          "step": 16,
+          "midi": 48,
+          "length": 4,
+          "velocity": 0.45
+        },
+        {
+          "step": 24,
+          "midi": 48,
+          "length": 4,
+          "velocity": 0.45
+        }
+      ]
+    }
+  ]
+}

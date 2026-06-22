@@ -220,12 +220,36 @@ PORTAL_CHARGE_RATIO = 0.50
 PORTAL_STRONG_RATIO = 2.0 / 3.0
 PORTAL_TRANSCEND_RATIO = 0.985
 PORTAL_ABSORB_X = -0.30
+# Portal swallowing / suction. The gameplay win condition still uses the
+# absorbed-cell ratio, but visible cells should disappear as soon as their
+# actual cube volume starts crossing the throat, not only when their centre point
+# has already passed it. This matters most once the route turns into world Y on
+# level 3, because the player can clearly see the rear layers poking through the
+# portal plane.
+PORTAL_VISUAL_ABSORB_LEAD = CELL_HALF * 1.15
+PORTAL_SUCTION_ENABLED = True
+PORTAL_SUCTION_START_BEFORE = 6.8
+PORTAL_SUCTION_AFTER = 3.2
+PORTAL_SUCTION_LATERAL_PAD = 2.3
+PORTAL_SUCTION_FORWARD_SPEED = 4.4
+PORTAL_SUCTION_LATERAL_STRENGTH = 7.0
 LEVEL_READY_SECONDS = 1.65
 
 # Level/module generation. Level 1 is the exact original straight tunnel.
-# Every later level adds one more same-style tunnel module after a 90-degree turn,
-# with the portal moved to the end of the final module.
-LEVEL_DIRECTIONS = ((1, 0), (0, 1), (1, 0), (0, -1))
+# Later levels add true cardinal-axis tunnel modules. Default routing uses real
+# 3D space: +X -> +Z -> +Y -> ... . Turning the vertical axis off keeps an
+# easier X/Z-only staircase for future easy-mode tuning.
+COURSE_ROUTE_ENABLE_VERTICAL_AXIS = True
+COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL = 3
+COURSE_ROUTE_2D_SPINE = ((1, 0, 0), (0, 0, 1))
+COURSE_ROUTE_3D_SPINE = ((1, 0, 0), (0, 0, 1), (0, 1, 0))
+COURSE_ROUTE_CLEARANCE = 1.0
+COURSE_ROUTE_DEBUG = False
+
+# One-shot spatiality warning. With the default 3D route, level 3 is where the
+# world-Y leg first appears, so announce the extra axis before materialization.
+SPACE_INTRO_SECONDS = 3.20
+SPACE_INTRO_FADE_IN_SECONDS = 1.10
 
 # L-turn geometry. A turn is not a huge extra box and it does not hijack
 # controls. It is just a same-cross-section joint cube with two openings, plus
@@ -2322,39 +2346,49 @@ BASE_LASER_TEMPLATES = list(LASERS)
 @dataclass
 class CourseModule:
     index: int
-    start_x: float
-    start_z: float
+    start: Vec3
     dir_x: float
+    dir_y: float
     dir_z: float
 
     @property
+    def direction(self) -> Vec3:
+        return Vec3(self.dir_x, self.dir_y, self.dir_z)
+
+    @property
+    def dir_key(self):
+        return _route_dir_key((self.dir_x, self.dir_y, self.dir_z))
+
+    @property
     def basis_x(self) -> Vec3:
-        return Vec3(self.dir_x, 0.0, self.dir_z)
+        return self.direction
 
     @property
     def basis_y(self) -> Vec3:
+        # Local +Y is a stable cross-section axis perpendicular to the corridor
+        # direction. For the original +X module this remains world +Y, preserving
+        # level 1 exactly. Vertical modules use world +Z as their readable "up"
+        # inside the pipe, because world +Y is then the corridor-forward axis.
+        dx, dy, dz = self.dir_key
+        if dy != 0:
+            return Vec3(0.0, 0.0, 1.0)
         return Vec3(0.0, 1.0, 0.0)
 
     @property
     def basis_z(self) -> Vec3:
-        # Local +Z is the corridor's sideways axis. For the original +X module
-        # this is world +Z, preserving level 1 exactly.
-        return Vec3(-self.dir_z, 0.0, self.dir_x)
+        # Right-handed basis: local X cross local Y = local Z.
+        return self.basis_x.cross(self.basis_y).normalized()
 
     def local_to_world(self, lx: float, ly: float, lz: float) -> Vec3:
         along = lx - COURSE_X_MIN
-        return Vec3(
-            self.start_x + self.dir_x * along + self.basis_z.x * lz,
-            ly,
-            self.start_z + self.dir_z * along + self.basis_z.z * lz,
-        )
+        return self.start + (self.basis_x * along) + (self.basis_y * ly) + (self.basis_z * lz)
 
     def world_to_local(self, p: Vec3) -> Vec3:
-        dx = p.x - self.start_x
-        dz = p.z - self.start_z
-        along = dx * self.dir_x + dz * self.dir_z
-        side = dx * self.basis_z.x + dz * self.basis_z.z
-        return Vec3(COURSE_X_MIN + along, p.y, side)
+        d = p - self.start
+        along = d.dot(self.basis_x)
+        side_y = d.dot(self.basis_y)
+        side_z = d.dot(self.basis_z)
+        return Vec3(COURSE_X_MIN + along, side_y, side_z)
 
     def end_center(self) -> Vec3:
         return self.local_to_world(COURSE_X_MAX, 0.0, 0.0)
@@ -2365,18 +2399,188 @@ PORTAL_MODULE = None
 ACTIVE_LEVEL = 1
 
 
+def _route_dir_key(direction):
+    dx, dy, dz = direction
+    return (int(round(dx)), int(round(dy)), int(round(dz)))
+
+
+def _route_reverse_dir(direction):
+    dx, dy, dz = _route_dir_key(direction)
+    return (-dx, -dy, -dz)
+
+
+def _route_dot(a, b) -> int:
+    ax, ay, az = _route_dir_key(a)
+    bx, by, bz = _route_dir_key(b)
+    return ax * bx + ay * by + az * bz
+
+
+def _route_module_length() -> float:
+    return COURSE_X_MAX - COURSE_X_MIN
+
+
+def _route_candidate_end(start: Vec3, direction) -> Vec3:
+    dx, dy, dz = _route_dir_key(direction)
+    length = _route_module_length()
+    return Vec3(start.x + dx * length, start.y + dy * length, start.z + dz * length)
+
+
+def _route_occupied_aabb_for_candidate(start: Vec3, direction):
+    """Approximate one 3D tunnel module as an inflated world-space AABB.
+
+    This is route-planning only. Actual collision remains CourseModule-local
+    pipe checks plus explicit same-size turn cubes.
+    """
+    dx, dy, dz = _route_dir_key(direction)
+    end = _route_candidate_end(start, direction)
+    side = TUNNEL_HALF + COURSE_ROUTE_CLEARANCE
+    joint = TURN_JOINT_HALF + COURSE_ROUTE_CLEARANCE
+
+    sx, sy, sz = start.x, start.y, start.z
+    ex, ey, ez = end.x, end.y, end.z
+
+    if dx != 0:
+        xmin, xmax = min(sx, ex), max(sx, ex)
+    else:
+        xmin, xmax = sx - side, sx + side
+    if dy != 0:
+        ymin, ymax = min(sy, ey), max(sy, ey)
+    else:
+        ymin, ymax = sy - side, sy + side
+    if dz != 0:
+        zmin, zmax = min(sz, ez), max(sz, ez)
+    else:
+        zmin, zmax = sz - side, sz + side
+
+    # Include the far joint cube. The start joint is allowed to touch the
+    # immediately previous module, so _route_candidate_clear() ignores that one.
+    xmin = min(xmin, ex - joint)
+    xmax = max(xmax, ex + joint)
+    ymin = min(ymin, ey - joint)
+    ymax = max(ymax, ey + joint)
+    zmin = min(zmin, ez - joint)
+    zmax = max(zmax, ez + joint)
+    return (xmin, xmax, ymin, ymax, zmin, zmax)
+
+
+def _route_aabbs_overlap(a, b) -> bool:
+    ax0, ax1, ay0, ay1, az0, az1 = a
+    bx0, bx1, by0, by1, bz0, bz1 = b
+    return not (
+        ax1 <= bx0 or bx1 <= ax0 or
+        ay1 <= by0 or by1 <= ay0 or
+        az1 <= bz0 or bz1 <= az0
+    )
+
+
+def _route_candidate_clear(candidate_aabb, existing_aabbs) -> bool:
+    # Ignore the immediately previous module: the candidate must share the L-joint
+    # at the previous end. Everything older is forbidden territory.
+    for aabb in existing_aabbs[:-1]:
+        if _route_aabbs_overlap(candidate_aabb, aabb):
+            return False
+    return True
+
+
+def _route_allowed_dirs():
+    """Cardinal route directions available for the current difficulty mode."""
+    if COURSE_ROUTE_ENABLE_VERTICAL_AXIS:
+        return ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+    return ((1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1))
+
+
+def _route_preferred_dir_for_index(idx: int):
+    """Preferred non-random expansion direction for module idx.
+
+    Before the configured vertical-axis unlock, and whenever vertical routing is
+    disabled, the route stays on the easier X/Z staircase. After the unlock, the
+    default spine cycles X/Z/Y so the maze occupies real 3D volume.
+    """
+    idx = max(0, int(idx))
+    if not COURSE_ROUTE_ENABLE_VERTICAL_AXIS or idx + 1 < COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL:
+        return COURSE_ROUTE_2D_SPINE[idx % len(COURSE_ROUTE_2D_SPINE)]
+    return COURSE_ROUTE_3D_SPINE[idx % len(COURSE_ROUTE_3D_SPINE)]
+
+
+def _route_fallback_candidates(current_dir):
+    """All legal 90-degree cardinal turns, never straight and never reverse."""
+    rev = _route_reverse_dir(current_dir)
+    return [
+        d for d in _route_allowed_dirs()
+        if d != _route_dir_key(current_dir) and d != rev and _route_dot(d, current_dir) == 0
+    ]
+
+
+def course_route_vertical_axis_active_for_level(level: int) -> bool:
+    return bool(COURSE_ROUTE_ENABLE_VERTICAL_AXIS and int(level) >= COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL)
+
+
+def make_course_directions_for_level(level: int):
+    """Return a deterministic self-avoiding route for this level.
+
+    Level 1 is the original +X tunnel. With vertical routing enabled, level 3
+    introduces the world-Y leg by default: +X -> +Z -> +Y. With the vertical
+    axis disabled, the route remains an X/Z-only self-avoiding staircase.
+
+    This is intentionally conservative. It avoids the random-walk failure mode
+    where high levels eventually fold into themselves. The fallback still only
+    considers clear 90-degree cardinal turns; it never emits a colliding module
+    as a last resort.
+    """
+    level = max(1, int(level))
+    directions = []
+    existing = []
+    cursor = Vec3(COURSE_X_MIN, 0.0, 0.0)
+    current_dir = None
+
+    for idx in range(level):
+        preferred = _route_preferred_dir_for_index(idx)
+        candidates = [preferred]
+        if current_dir is not None:
+            # The preferred spine is designed to turn, but keep the rule explicit
+            # and add all other clear turns as backup candidates.
+            candidates = [d for d in candidates if _route_dot(d, current_dir) == 0]
+            for d in _route_fallback_candidates(current_dir):
+                if d not in candidates:
+                    candidates.append(d)
+
+        chosen = None
+        chosen_aabb = None
+        for cand in candidates:
+            aabb = _route_occupied_aabb_for_candidate(cursor, cand)
+            if _route_candidate_clear(aabb, existing):
+                chosen = cand
+                chosen_aabb = aabb
+                break
+
+        if chosen is None:
+            raise RuntimeError(
+                f"Cube Libre 3D route generator got trapped at level={level}, module={idx + 1}; "
+                "refusing to generate self-colliding maze geometry."
+            )
+
+        directions.append(chosen)
+        existing.append(chosen_aabb)
+        cursor = _route_candidate_end(cursor, chosen)
+        current_dir = chosen
+
+    if COURSE_ROUTE_DEBUG:
+        mode = "3D" if course_route_vertical_axis_active_for_level(level) else "2D"
+        print(f"[DEBUG] level {level} {mode} route: {directions}")
+    return tuple(directions)
+
+
 def make_course_modules(level: int):
     level = max(1, int(level))
     modules = []
-    sx, sz = COURSE_X_MIN, 0.0
-    for idx in range(level):
-        dx, dz = LEVEL_DIRECTIONS[idx % len(LEVEL_DIRECTIONS)]
-        mod = CourseModule(idx, sx, sz, float(dx), float(dz))
+    cursor = Vec3(COURSE_X_MIN, 0.0, 0.0)
+    directions = make_course_directions_for_level(level)
+    for idx, direction in enumerate(directions):
+        dx, dy, dz = _route_dir_key(direction)
+        mod = CourseModule(idx, cursor, float(dx), float(dy), float(dz))
         modules.append(mod)
-        end = mod.end_center()
-        sx, sz = end.x, end.z
+        cursor = mod.end_center()
     return modules
-
 
 def clone_laser_for_module(template: LaserGrid, module: CourseModule, level: int) -> LaserGrid:
     # Original template centers are already in level-1 local coordinates. Use their
@@ -2440,14 +2644,14 @@ def module_has_prev_turn(module: CourseModule) -> bool:
     if module.index <= 0:
         return False
     prev = COURSE_MODULES[module.index - 1]
-    return (prev.dir_x, prev.dir_z) != (module.dir_x, module.dir_z)
+    return prev.dir_key != module.dir_key
 
 
 def module_has_next_turn(module: CourseModule) -> bool:
     if module.index >= len(COURSE_MODULES) - 1:
         return False
     nxt = COURSE_MODULES[module.index + 1]
-    return (nxt.dir_x, nxt.dir_z) != (module.dir_x, module.dir_z)
+    return nxt.dir_key != module.dir_key
 
 
 def module_pipe_lx_span(module: CourseModule, pad: float = 0.0):
@@ -2499,48 +2703,46 @@ def module_box_segments(module: CourseModule):
     return [(corners[a], corners[b]) for a, b in edges]
 
 def turn_chamber_joints():
-    """Return explicit modular turn joints.
+    """Return explicit modular 3D turn joints.
 
     Each joint is a same-cross-section cube at the point where two corridor
-    modules meet. It has exactly two open lateral faces: the face where the
-    incoming tube arrives, and the face where the outgoing tube leaves. The
-    closed faces are drawn with guide/grid lines so the joint reads as a pipe
-    fitting instead of a magic all-sides escape cube.
+    modules meet. It has two open faces in any of the six world-axis directions:
+    the incoming face and the outgoing face. This is the actual 3D L-corner, not
+    an X/Z-only floor-plan bend.
     """
     joints = []
     for idx in range(len(COURSE_MODULES) - 1):
         a = COURSE_MODULES[idx]
         b = COURSE_MODULES[idx + 1]
-        if (a.dir_x, a.dir_z) == (b.dir_x, b.dir_z):
+        if a.dir_key == b.dir_key:
             continue
         center = a.end_center()
-        # Opening normals in the horizontal X/Z plane. Incoming tube reaches
-        # the joint from behind module a, outgoing tube leaves along module b.
+        ax, ay, az = a.dir_key
+        bx, by, bz = b.dir_key
         open_faces = {
-            (int(-a.dir_x), int(-a.dir_z)),
-            (int( b.dir_x), int( b.dir_z)),
+            (-ax, -ay, -az),
+            ( bx,  by,  bz),
         }
         joints.append((center, open_faces))
     return joints
-
 
 def turn_chamber_centers():
     return [center for center, _open_faces in turn_chamber_joints()]
 
 
 def turn_chamber_segments(center: Vec3):
-    # Same-cross-section corner cube: 14x14x14 when the tunnel is y/z -7..7.
-    # This is the L-pipe joint, not an oversized mercy box.
+    # Same-cross-section 3D corner cube. Unlike the old X/Z-only version, this
+    # follows the joint center on all three axes, so vertical turns are real.
     h = TURN_JOINT_HALF
     corners = [
-        Vec3(center.x - h, COURSE_Y_MIN, center.z - h),
-        Vec3(center.x + h, COURSE_Y_MIN, center.z - h),
-        Vec3(center.x + h, COURSE_Y_MAX, center.z - h),
-        Vec3(center.x - h, COURSE_Y_MAX, center.z - h),
-        Vec3(center.x - h, COURSE_Y_MIN, center.z + h),
-        Vec3(center.x + h, COURSE_Y_MIN, center.z + h),
-        Vec3(center.x + h, COURSE_Y_MAX, center.z + h),
-        Vec3(center.x - h, COURSE_Y_MAX, center.z + h),
+        Vec3(center.x - h, center.y - h, center.z - h),
+        Vec3(center.x + h, center.y - h, center.z - h),
+        Vec3(center.x + h, center.y + h, center.z - h),
+        Vec3(center.x - h, center.y + h, center.z - h),
+        Vec3(center.x - h, center.y - h, center.z + h),
+        Vec3(center.x + h, center.y - h, center.z + h),
+        Vec3(center.x + h, center.y + h, center.z + h),
+        Vec3(center.x - h, center.y + h, center.z + h),
     ]
     edges = [
         (0, 1), (1, 2), (2, 3), (3, 0),
@@ -2548,7 +2750,6 @@ def turn_chamber_segments(center: Vec3):
         (0, 4), (1, 5), (2, 6), (3, 7),
     ]
     return [(corners[a], corners[b]) for a, b in edges]
-
 
 def _grid_values(lo: float, hi: float, step: float = 2.0):
     v = math.ceil(lo / step) * step
@@ -2558,46 +2759,41 @@ def _grid_values(lo: float, hi: float, step: float = 2.0):
 
 
 def turn_chamber_face_grid_segments(center: Vec3, open_faces):
-    """Guide-grid lines on the closed faces of a modular turn joint.
-
-    The two open faces are deliberately left ungridded. These are visuals only;
-    collision and laser damage are handled by point_inside_course() and LASERS.
-    """
+    """Guide-grid lines on the closed faces of a modular 3D turn joint."""
     h = TURN_JOINT_HALF
     x0, x1 = center.x - h, center.x + h
+    y0, y1 = center.y - h, center.y + h
     z0, z1 = center.z - h, center.z + h
-    y0, y1 = COURSE_Y_MIN, COURSE_Y_MAX
     segs = []
 
-    # Lateral side faces. Normals are encoded as (dx, dz).
-    lateral_faces = [
-        ((-1, 0), 'x', x0),
-        (( 1, 0), 'x', x1),
-        ((0, -1), 'z', z0),
-        ((0,  1), 'z', z1),
-    ]
-    for normal, axis, value in lateral_faces:
+    # X-normal faces: draw a Y/Z grid.
+    for normal, x in (((-1, 0, 0), x0), ((1, 0, 0), x1)):
         if normal in open_faces:
             continue
-        if axis == 'x':
-            for z in _grid_values(z0, z1, 2.0):
-                segs.append((Vec3(value, y0, z), Vec3(value, y1, z)))
-            for y in _grid_values(y0, y1, 2.0):
-                segs.append((Vec3(value, y, z0), Vec3(value, y, z1)))
-        else:
-            for x in _grid_values(x0, x1, 2.0):
-                segs.append((Vec3(x, y0, value), Vec3(x, y1, value)))
-            for y in _grid_values(y0, y1, 2.0):
-                segs.append((Vec3(x0, y, value), Vec3(x1, y, value)))
+        for z in _grid_values(z0, z1, 2.0):
+            segs.append((Vec3(x, y0, z), Vec3(x, y1, z)))
+        for y in _grid_values(y0, y1, 2.0):
+            segs.append((Vec3(x, y, z0), Vec3(x, y, z1)))
 
-    # Floor and ceiling are closed parts of the pipe, so grid them too.
-    for y in (y0, y1):
+    # Y-normal faces: draw an X/Z grid.
+    for normal, y in (((0, -1, 0), y0), ((0, 1, 0), y1)):
+        if normal in open_faces:
+            continue
         for x in _grid_values(x0, x1, 2.0):
             segs.append((Vec3(x, y, z0), Vec3(x, y, z1)))
         for z in _grid_values(z0, z1, 2.0):
             segs.append((Vec3(x0, y, z), Vec3(x1, y, z)))
-    return segs
 
+    # Z-normal faces: draw an X/Y grid.
+    for normal, z in (((0, 0, -1), z0), ((0, 0, 1), z1)):
+        if normal in open_faces:
+            continue
+        for x in _grid_values(x0, x1, 2.0):
+            segs.append((Vec3(x, y0, z), Vec3(x, y1, z)))
+        for y in _grid_values(y0, y1, 2.0):
+            segs.append((Vec3(x0, y, z), Vec3(x1, y, z)))
+
+    return segs
 
 def all_turn_chamber_face_grid_segments():
     segs = []
@@ -2607,12 +2803,13 @@ def all_turn_chamber_face_grid_segments():
 
 
 def point_inside_turn_chamber(p: Vec3, pad: float = 0.0) -> bool:
-    # Same-size corner cube with two corridor openings. This is enough for a
-    # finite cube to rotate through the L without inventing a giant invisible room.
+    # Same-size 3D corner cube with two corridor openings. The center follows
+    # X/Y/Z, so vertical bends are solid playable volume instead of fake floor
+    # turns.
     h = TURN_JOINT_HALF + pad
     for center in turn_chamber_centers():
         if (center.x - h <= p.x <= center.x + h and
-                COURSE_Y_MIN - pad <= p.y <= COURSE_Y_MAX + pad and
+                center.y - h <= p.y <= center.y + h and
                 center.z - h <= p.z <= center.z + h):
             return True
     return False
@@ -2685,7 +2882,7 @@ def course_aabb(pad: float = 0.0):
     for center in turn_chamber_centers():
         h = TURN_JOINT_HALF
         for x in (center.x - h, center.x + h):
-            for y in (COURSE_Y_MIN, COURSE_Y_MAX):
+            for y in (center.y - h, center.y + h):
                 for z in (center.z - h, center.z + h):
                     pts.append(Vec3(x, y, z))
     if not pts:
@@ -3644,19 +3841,44 @@ def fragment_blink_alpha(fragment: Fragment, t: float) -> float:
     return 0.22 + 0.78 * pulse
 
 
-def portal_cell_absorbed(cell_world_pos: Vec3) -> bool:
-    """Whether an intact cell has committed into the portal throat.
-
-    Absorbed cells are still counted as surviving cargo, but are no longer
-    drawn as exiting the far side. This makes the portal behave like a swallowing
-    volume instead of a transparent checkpoint plane.
-    """
+def _portal_cell_local_metrics(cell_world_pos: Vec3):
     if PORTAL_MODULE is None:
-        return False
+        return None
     local = PORTAL_MODULE.world_to_local(cell_world_pos)
     dx = local.x - PORTAL_LOCAL_X
     lateral = max(abs(local.y), abs(local.z))
+    return dx, lateral
+
+
+def portal_cell_absorbed(cell_world_pos: Vec3) -> bool:
+    """Whether an intact cell has committed into the portal throat.
+
+    This is the scoring/win-condition swallow test. It stays centre-based so the
+    player still has to actually commit the body into the exit.
+    """
+    metrics = _portal_cell_local_metrics(cell_world_pos)
+    if metrics is None:
+        return False
+    dx, lateral = metrics
     return dx >= PORTAL_ABSORB_X and lateral <= PORTAL_CAPTURE_HALF
+
+
+def portal_cell_visually_absorbed(cell_world_pos: Vec3) -> bool:
+    """Whether a cell should stop rendering as the portal swallows it.
+
+    Unlike the win-condition test, this accounts for the mini-cube's physical
+    half-size. Without this, cells can visibly poke out behind the portal even
+    though their front face is already inside the throat, especially on world-Y
+    portal approaches.
+    """
+    metrics = _portal_cell_local_metrics(cell_world_pos)
+    if metrics is None:
+        return False
+    dx, lateral = metrics
+    return (
+        dx + PORTAL_VISUAL_ABSORB_LEAD >= PORTAL_ABSORB_X and
+        lateral <= PORTAL_CAPTURE_HALF + CELL_HALF * 0.55
+    )
 
 
 def draw_player(player: PlayerCube, absorb_portal_cells: bool = False, t: float = 0.0):
@@ -3664,7 +3886,7 @@ def draw_player(player: PlayerCube, absorb_portal_cells: bool = False, t: float 
     # portal and stop rendering, but they remain alive for scoring/transcendence.
     for cell in sorted(player.alive_cells):
         p = player.cell_world_pos(cell)
-        if absorb_portal_cells and portal_cell_absorbed(p):
+        if absorb_portal_cells and portal_cell_visually_absorbed(p):
             continue
         glPushMatrix()
         glTranslatef(p.x, p.y, p.z)
@@ -5224,7 +5446,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
 
     # Slow ship-engine ambience: present on the title screen and normal level,
     # softer during overlays, absent in the hard-white death void and portal wash.
-    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "time_intro"):
+    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "space_intro", "time_intro"):
         charge = portal_overlap_charge(player) if game_state == "playing" else 0.0
         if game_state in ("title", "quit_confirm"):
             ambient_vol = 0.34
@@ -5234,7 +5456,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
             ambient_vol = 0.20
         elif game_state == "result_overlay":
             ambient_vol = 0.17
-        elif game_state == "time_intro":
+        elif game_state in ("space_intro", "time_intro"):
             ambient_vol = 0.20
         else:
             ambient_vol = 0.15 + 0.05 * charge
@@ -5245,7 +5467,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
     # Sparse alien-gamelan tones: long struck-metal notes with long pauses. This is
     # menu/level atmosphere, so it stays away from the hard-white death void and the
     # portal climax where the dedicated portal wash should own the foreground.
-    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "time_intro"):
+    if game_state in ("title", "quit_confirm", "level_ready", "course_materialize", "playing", "result_overlay", "space_intro", "time_intro"):
         if game_state in ("title", "quit_confirm"):
             gamelan_vol = 0.260
         elif game_state == "level_ready":
@@ -5254,7 +5476,7 @@ def audio_update(game_state: str, player: "PlayerCube", level: int = 1, timed_le
             gamelan_vol = 0.205
         elif game_state == "result_overlay":
             gamelan_vol = 0.180
-        elif game_state == "time_intro":
+        elif game_state in ("space_intro", "time_intro"):
             gamelan_vol = 0.160
         else:
             gamelan_vol = 0.190
@@ -5553,6 +5775,52 @@ def portal_reached(player: PlayerCube) -> bool:
     return portal_absorption_ratio(player) >= PORTAL_TRANSCEND_RATIO
 
 
+def apply_portal_suction(player: PlayerCube, dt: float):
+    """Gently pull an aligned player cube into the portal throat.
+
+    This is not steering for the whole maze. It only activates inside the portal
+    approach slab, once the player is already close enough and laterally aligned
+    with the square exit. The goal is to make the portal behave like an exit that
+    swallows the cube volume instead of a brittle centre-point checkpoint.
+    """
+    if not PORTAL_SUCTION_ENABLED or PORTAL_MODULE is None or player is None:
+        return
+    if player.intact_count() <= 0 or dt <= 0.0:
+        return
+
+    local = PORTAL_MODULE.world_to_local(player.origin)
+    dx = local.x - PORTAL_LOCAL_X
+    lateral = max(abs(local.y), abs(local.z))
+
+    if dx < -PORTAL_SUCTION_START_BEFORE or dx > PORTAL_SUCTION_AFTER:
+        return
+    if lateral > PORTAL_CAPTURE_HALF + PORTAL_SUCTION_LATERAL_PAD:
+        return
+
+    approach = smoothstep((dx + PORTAL_SUCTION_START_BEFORE) / max(0.001, PORTAL_SUCTION_START_BEFORE))
+    lateral_gate = 1.0 - clamp((lateral - PORTAL_CAPTURE_HALF) / max(0.001, PORTAL_SUCTION_LATERAL_PAD), 0.0, 1.0)
+    strength = approach * lateral_gate
+    if strength <= 0.001:
+        return
+
+    # Pull laterally toward the portal centre, then nudge forward into the throat.
+    # Clamp each component so the portal never teleports the cube across the map.
+    lateral_gain = min(1.0, PORTAL_SUCTION_LATERAL_STRENGTH * dt * strength)
+    local_y_step = -local.y * lateral_gain
+    local_z_step = -local.z * lateral_gain
+
+    target_dx = PORTAL_ABSORB_X + CELL_SPACING * 2.25
+    forward_deficit = max(0.0, target_dx - dx)
+    forward_step = min(forward_deficit, PORTAL_SUCTION_FORWARD_SPEED * dt * strength)
+
+    delta = (
+        PORTAL_MODULE.basis_x * forward_step +
+        PORTAL_MODULE.basis_y * local_y_step +
+        PORTAL_MODULE.basis_z * local_z_step
+    )
+    player.origin = player.origin + delta
+
+
 def render_level_ready(t: float, level: int):
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     glMatrixMode(GL_MODELVIEW)
@@ -5585,10 +5853,11 @@ def render_level_ready(t: float, level: int):
     draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2)
 
 
-def render_time_intro(t: float, timer: float):
-    """White void announcement before level 5 introduces the timed maze legs."""
-    progress = clamp(timer / max(0.001, TIME_INTRO_SECONDS), 0.0, 1.0)
-    fade = smoothstep(clamp(timer / max(0.001, TIME_INTRO_FADE_IN_SECONDS), 0.0, 1.0))
+def _render_void_intro_card(t: float, timer: float, total_seconds: float, fade_seconds: float,
+                            title_text: str, subtitle_text: str):
+    """Shared white-void intro card used by SPACE and TIME phase warnings."""
+    progress = clamp(timer / max(0.001, total_seconds), 0.0, 1.0)
+    fade = smoothstep(clamp(timer / max(0.001, fade_seconds), 0.0, 1.0))
     inv = reassembly_inversion_amount(progress)
     void_level = 1.0 - inv
     glClearColor(void_level, void_level, void_level, 1.0)
@@ -5601,11 +5870,11 @@ def render_time_intro(t: float, timer: float):
     small = get_font(22, False)
     shade = int(255 * (1.0 - fade))
     alpha = int(255 * fade)
-    label = font.render("TIME ...", True, (shade, shade, shade))
-    sub = small.render(f"{int(TIME_PER_LEG_SECONDS)} SECONDS PER LEG FROM HERE", True, (shade, shade, shade))
+    label = font.render(title_text, True, (shade, shade, shade))
+    sub = small.render(subtitle_text, True, (shade, shade, shade))
     label.set_alpha(alpha)
     sub.set_alpha(alpha)
-    panel = pygame.Surface((840, 220), pygame.SRCALPHA)
+    panel = pygame.Surface((900, 240), pygame.SRCALPHA)
     breath = 1.0 + 0.012 * math.sin(t * 2.8)
     if progress > 0.72:
         out = smoothstep((progress - 0.72) / 0.28)
@@ -5616,8 +5885,26 @@ def render_time_intro(t: float, timer: float):
         h = max(1, int(label.get_height() * breath))
         label = pygame.transform.smoothscale(label, (w, h))
     panel.blit(label, ((panel.get_width() - label.get_width()) // 2, 46))
-    panel.blit(sub, ((panel.get_width() - sub.get_width()) // 2, 145))
+    panel.blit(sub, ((panel.get_width() - sub.get_width()) // 2, 150))
     draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2)
+
+
+def render_space_intro(t: float, timer: float):
+    """White void announcement before the first true vertical-axis level."""
+    _render_void_intro_card(
+        t, timer, SPACE_INTRO_SECONDS, SPACE_INTRO_FADE_IN_SECONDS,
+        "SPACE ...",
+        "WORLD Y AXIS OPENS FROM HERE",
+    )
+
+
+def render_time_intro(t: float, timer: float):
+    """White void announcement before level 5 introduces the timed maze legs."""
+    _render_void_intro_card(
+        t, timer, TIME_INTRO_SECONDS, TIME_INTRO_FADE_IN_SECONDS,
+        "TIME ...",
+        f"{int(TIME_PER_LEG_SECONDS)} SECONDS PER LEG FROM HERE",
+    )
 
 
 def render_time_counter(t: float, seconds_left: float):
@@ -6330,7 +6617,7 @@ def control_module_for_point(p: Vec3, forward_sign: float = 0.0) -> CourseModule
     # Kept only for old debug references. Gameplay controls are world-space in
     # handle_input(); no automatic turn steering.
     if not COURSE_MODULES:
-        return CourseModule(0, COURSE_X_MIN, 0.0, 1.0, 0.0)
+        return CourseModule(0, Vec3(COURSE_X_MIN, 0.0, 0.0), 1.0, 0.0, 0.0)
     return COURSE_MODULES[0]
 
 
@@ -6399,6 +6686,7 @@ def handle_input(player: PlayerCube, dt: float):
     dx = clamp(x_intent, -1, 1) * step
 
     player.origin = Vec3(player.origin.x + dx, player.origin.y + dy, player.origin.z + dz)
+    apply_portal_suction(player, dt)
 
     # Soft AABB clamp only keeps the origin from vanishing into space. Actual
     # damage/collision is handled by point_inside_course(), i.e. the L-pipe union.
@@ -6533,6 +6821,8 @@ def main():
     reset_confirm_active = False
     reset_confirm_previous_paused = False
     locate_camera_enabled = AUTO_CENTER_ON_PLAYER
+    spatial_mode_intro_seen = False
+    space_intro_timer = 0.0
     timed_mode_intro_seen = False
     time_intro_timer = 0.0
     timed_leg_timer = TIME_PER_LEG_SECONDS
@@ -6541,7 +6831,7 @@ def main():
     # Small explicit state machine. This prevents title, level ready, course materialization,
     # death/white-void reassembly, portal warp, input and scoring overlays from stomping on
     # each other.
-    game_state = "title"  # title | quit_confirm | level_ready | time_intro | course_materialize | playing | death_dissolve | reassembly | reassembly_flash | portal_warp | result_overlay
+    game_state = "title"  # title | quit_confirm | level_ready | space_intro | time_intro | course_materialize | playing | death_dissolve | reassembly | reassembly_flash | portal_warp | result_overlay
     death_timer = 0.0
     level_ready_timer = 0.0
     course_materialize_timer = 0.0
@@ -6666,9 +6956,11 @@ def main():
 
     def start_new_run(label="NEW RUN"):
         nonlocal score, completed_level, next_level_to_start, last_escape_count, win_overlay_timer, portal_warp_timer, death_timer, course_materialize_timer
-        nonlocal timed_mode_intro_seen, time_intro_timer, timed_leg_timer, timed_current_module
+        nonlocal spatial_mode_intro_seen, space_intro_timer, timed_mode_intro_seen, time_intro_timer, timed_leg_timer, timed_current_module
         score = 0
         completed_level = 0
+        spatial_mode_intro_seen = False
+        space_intro_timer = 0.0
         timed_mode_intro_seen = False
         time_intro_timer = 0.0
         timed_leg_timer = TIME_PER_LEG_SECONDS
@@ -6689,7 +6981,7 @@ def main():
         which matters once a run has reached deeper levels.
         """
         nonlocal next_level_to_start, last_escape_count, win_overlay_timer, portal_warp_timer, death_timer, course_materialize_timer
-        nonlocal time_intro_timer, timed_leg_timer, timed_current_module
+        nonlocal space_intro_timer, time_intro_timer, timed_leg_timer, timed_current_module
         target = max(1, int(current_level))
         next_level_to_start = max(next_level_to_start, target)
         last_escape_count = 0
@@ -6697,6 +6989,7 @@ def main():
         portal_warp_timer = 0.0
         death_timer = 0.0
         course_materialize_timer = 0.0
+        space_intro_timer = 0.0
         time_intro_timer = 0.0
         timed_leg_timer = TIME_PER_LEG_SECONDS
         timed_current_module = 0
@@ -6735,6 +7028,17 @@ def main():
         audio_resume_all()
         restart_current_level("RESET CURRENT LEVEL")
 
+    def begin_space_intro(target_level: int):
+        nonlocal game_state, space_intro_timer, current_level, next_level_to_start, damage_timer, paused
+        paused = False
+        audio_resume_all()
+        current_level = max(COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL, int(target_level))
+        next_level_to_start = current_level
+        space_intro_timer = 0.0
+        damage_timer = 999.0
+        game_state = "space_intro"
+        set_message("SPACE ...", SPACE_INTRO_SECONDS)
+
     def begin_time_intro(target_level: int):
         nonlocal game_state, time_intro_timer, current_level, next_level_to_start, damage_timer, paused
         paused = False
@@ -6747,13 +7051,18 @@ def main():
         set_message("TIME ...", TIME_INTRO_SECONDS)
 
     def advance_after_transcendence():
-        nonlocal next_level_to_start, timed_mode_intro_seen
+        nonlocal next_level_to_start, spatial_mode_intro_seen, timed_mode_intro_seen
         # Belt-and-suspenders against the recurring "level 1 twice" bug: if a
         # result overlay exists, never allow the next level to be less than the
         # just-completed level + 1, regardless of stale UI/event state.
         target = max(2 if completed_level <= 1 else completed_level + 1, next_level_to_start, current_level + 1)
         next_level_to_start = target
-        if target >= TIME_MODE_START_LEVEL and completed_level == TIME_MODE_START_LEVEL - 1 and not timed_mode_intro_seen:
+        if (course_route_vertical_axis_active_for_level(target) and
+                completed_level == COURSE_ROUTE_VERTICAL_AXIS_START_LEVEL - 1 and
+                not spatial_mode_intro_seen):
+            spatial_mode_intro_seen = True
+            begin_space_intro(target)
+        elif target >= TIME_MODE_START_LEVEL and completed_level == TIME_MODE_START_LEVEL - 1 and not timed_mode_intro_seen:
             timed_mode_intro_seen = True
             begin_time_intro(target)
         else:
@@ -6942,7 +7251,7 @@ def main():
                     # to level 1. During a run, plain R only reminds the player;
                     # Ctrl+R opens a confirmation with full-run/current-level/cancel.
                     active_run_states = (
-                        "level_ready", "time_intro", "course_materialize", "playing",
+                        "level_ready", "space_intro", "time_intro", "course_materialize", "playing",
                         "death_dissolve", "reassembly", "reassembly_flash", "portal_warp",
                     )
                     ctrl_down = bool(mods & pygame.KMOD_CTRL)
@@ -6998,6 +7307,11 @@ def main():
             if level_ready_timer >= LEVEL_READY_SECONDS:
                 level_ready_timer = 0.0
                 begin_course_materialize(f"LEVEL {current_level}")
+
+        elif game_state == "space_intro":
+            space_intro_timer += dt
+            if space_intro_timer >= SPACE_INTRO_SECONDS:
+                begin_level_ready(next_level_to_start, f"LEVEL {next_level_to_start} GET READY")
 
         elif game_state == "time_intro":
             time_intro_timer += dt
@@ -7149,6 +7463,8 @@ def main():
             render_level_ready(t, current_level)
             ready_fade = 1.0 - smoothstep(level_ready_timer / max(0.001, LEVEL_READY_FADE_IN_SECONDS))
             render_fullscreen_overlay((1.0, 1.0, 1.0), ready_fade)
+        elif game_state == "space_intro":
+            render_space_intro(t, space_intro_timer)
         elif game_state == "time_intro":
             render_time_intro(t, time_intro_timer)
         else:
