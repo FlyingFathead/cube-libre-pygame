@@ -780,6 +780,15 @@ class AudioLabApp:
         self.realtime_preview = True
         self.last_realtime_refresh = 0.0
         self.realtime_refresh_interval = 0.12
+        # BPM direct-entry state. Double-click the BPM value to type a number;
+        # Enter commits, Esc cancels. Arrows/wheel remain for quick nudging.
+        self.bpm_editing = False
+        self.bpm_edit_buffer = ""
+        self.bpm_edit_select_all = False
+        self.bpm_edit_started_at = 0.0
+        self.last_bpm_click_at = 0.0
+        self.last_bpm_click_pos = (0, 0)
+        self.last_bpm_click_button = 0
         self.refresh_patch_files()
         self.load_presets_into_dir_once()
 
@@ -925,13 +934,14 @@ class AudioLabApp:
         self.last_realtime_refresh = now
         self.status = f"live-applied @ {format_transport_time(cursor)}"
 
-    def change_bpm(self, delta: int):
+    def set_bpm_absolute(self, bpm_value: int, status_prefix: str = "tempo"):
         old_step = max(1e-6, step_duration_seconds(self.patch))
         old_pos = self.current_position_seconds()
         old_frac_step = old_pos / old_step
         old_bpm = int(self.patch.get("bpm", DEFAULT_BPM))
-        new_bpm = int(clamp(old_bpm + int(delta), 40, 260))
+        new_bpm = int(clamp(int(bpm_value), 40, 260))
         if new_bpm == old_bpm:
+            self.status = f"{status_prefix} {new_bpm} BPM"
             return
         self.patch["bpm"] = new_bpm
         new_pos = clamp(old_frac_step * step_duration_seconds(self.patch), 0.0, pattern_duration_seconds(self.patch))
@@ -947,7 +957,73 @@ class AudioLabApp:
             if self.is_paused:
                 self.pause_started_at = now
         self.preview_dirty = True
-        self.status = f"tempo {new_bpm} BPM"
+        self.status = f"{status_prefix} {new_bpm} BPM"
+
+    def change_bpm(self, delta: int):
+        old_bpm = int(self.patch.get("bpm", DEFAULT_BPM))
+        self.set_bpm_absolute(old_bpm + int(delta))
+
+    def begin_bpm_edit(self):
+        self.bpm_editing = True
+        self.bpm_edit_buffer = str(int(self.patch.get("bpm", DEFAULT_BPM)))
+        self.bpm_edit_select_all = True
+        self.bpm_edit_started_at = time.time()
+        self.status = "type BPM, Enter commits, Esc cancels"
+
+    def cancel_bpm_edit(self):
+        self.bpm_editing = False
+        self.bpm_edit_buffer = ""
+        self.bpm_edit_select_all = False
+        self.status = "BPM edit cancelled"
+
+    def commit_bpm_edit(self):
+        raw = self.bpm_edit_buffer.strip()
+        self.bpm_editing = False
+        self.bpm_edit_buffer = ""
+        self.bpm_edit_select_all = False
+        if not raw:
+            self.status = "BPM unchanged"
+            return
+        try:
+            bpm = int(raw)
+        except ValueError:
+            self.status = "BPM must be a number"
+            return
+        clipped = int(clamp(bpm, 40, 260))
+        self.set_bpm_absolute(clipped, status_prefix="typed tempo")
+        if clipped != bpm:
+            self.status += " (clamped 40-260)"
+
+    def handle_bpm_edit_keydown(self, event) -> bool:
+        if not self.bpm_editing:
+            return False
+        key = event.key
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.commit_bpm_edit()
+            return True
+        if key == pygame.K_ESCAPE:
+            self.cancel_bpm_edit()
+            return True
+        if key == pygame.K_BACKSPACE:
+            if self.bpm_edit_select_all:
+                self.bpm_edit_buffer = ""
+                self.bpm_edit_select_all = False
+            else:
+                self.bpm_edit_buffer = self.bpm_edit_buffer[:-1]
+            return True
+        if key == pygame.K_DELETE:
+            self.bpm_edit_buffer = ""
+            self.bpm_edit_select_all = False
+            return True
+        ch = getattr(event, "unicode", "")
+        if ch and ch.isdigit():
+            if self.bpm_edit_select_all:
+                self.bpm_edit_buffer = ch
+                self.bpm_edit_select_all = False
+            elif len(self.bpm_edit_buffer) < 3:
+                self.bpm_edit_buffer += ch
+            return True
+        return True
 
     def export_wav(self, target_asset: Optional[str] = None, install: bool = False):
         if self.preview_dirty or self.last_render is None:
@@ -1277,7 +1353,7 @@ class AudioLabApp:
         elif key == "bpm_up":
             self.change_bpm(1)
         elif key == "bpm_display":
-            self.change_bpm(1)
+            self.begin_bpm_edit()
         elif key == "base_down":
             self.patch["base_midi"] = int(clamp(int(self.patch.get("base_midi", BASE_MIDI)) - 12, 12, 84)); self.preview_dirty = True
         elif key == "base_up":
@@ -1290,6 +1366,8 @@ class AudioLabApp:
             i = int(key.split("_")[1]); self.patch["tracks"][i]["solo"] = not self.patch["tracks"][i].get("solo"); self.preview_dirty = True
 
     def handle_keydown(self, event):
+        if self.handle_bpm_edit_keydown(event):
+            return
         mods = pygame.key.get_mods()
         ctrl = bool(mods & pygame.KMOD_CTRL)
         shift = bool(mods & pygame.KMOD_SHIFT)
@@ -1339,17 +1417,42 @@ class AudioLabApp:
         pos = event.pos
         mods = pygame.key.get_mods()
         bpm_step = 5 if (mods & pygame.KMOD_SHIFT) else 1
+        now = time.time()
         for key, rect in self.buttons.items():
             if rect.collidepoint(pos):
                 if key == "bpm_display":
-                    self.change_bpm(-bpm_step if event.button == 3 else bpm_step)
+                    is_double = (
+                        event.button == 1 and
+                        self.last_bpm_click_button == 1 and
+                        now - self.last_bpm_click_at <= 0.38 and
+                        abs(pos[0] - self.last_bpm_click_pos[0]) <= 6 and
+                        abs(pos[1] - self.last_bpm_click_pos[1]) <= 6
+                    )
+                    self.last_bpm_click_at = now
+                    self.last_bpm_click_pos = pos
+                    self.last_bpm_click_button = event.button
+                    if is_double:
+                        self.begin_bpm_edit()
+                    elif event.button == 3:
+                        self.change_bpm(-bpm_step)
+                    else:
+                        self.status = "double-click BPM to type; arrows/wheel nudge"
+                    return
                 elif key == "bpm_up":
+                    if self.bpm_editing:
+                        self.commit_bpm_edit()
                     self.change_bpm(bpm_step)
                 elif key == "bpm_down":
+                    if self.bpm_editing:
+                        self.commit_bpm_edit()
                     self.change_bpm(-bpm_step)
                 else:
+                    if self.bpm_editing:
+                        self.commit_bpm_edit()
                     self.handle_button(key)
                 return
+        if self.bpm_editing:
+            self.commit_bpm_edit()
         for name, slider in self.sliders.items():
             if slider.rect.inflate(0, 12).collidepoint(pos):
                 self.dragging_slider = slider
@@ -1380,6 +1483,8 @@ class AudioLabApp:
                 pos = pygame.mouse.get_pos()
                 bpm_rects = [self.buttons.get(k) for k in ("bpm_display", "bpm_up", "bpm_down")]
                 if any(r and r.collidepoint(pos) for r in bpm_rects):
+                    if self.bpm_editing:
+                        self.commit_bpm_edit()
                     step = 5 if (pygame.key.get_mods() & pygame.KMOD_SHIFT) else 1
                     self.change_bpm(int(event.y) * step)
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -1397,10 +1502,24 @@ class AudioLabApp:
         if not display or not up or not down:
             return
         bpm = int(self.patch.get("bpm", DEFAULT_BPM))
+        editing = bool(self.bpm_editing)
         pygame.draw.rect(self.screen, (12, 22, 25), display, border_radius=6)
-        pygame.draw.rect(self.screen, (92, 145, 152), display, width=1, border_radius=6)
-        txt = self.font.render(f"{bpm:03d} BPM", True, (226, 246, 242))
-        self.screen.blit(txt, (display.centerx - txt.get_width() // 2, display.centery - txt.get_height() // 2))
+        pygame.draw.rect(self.screen, (170, 230, 205) if editing else (92, 145, 152), display, width=2 if editing else 1, border_radius=6)
+        if editing:
+            shown = self.bpm_edit_buffer if self.bpm_edit_buffer else ""
+            cursor_on = int((time.time() - self.bpm_edit_started_at) * 2.8) % 2 == 0
+            suffix = " BPM"
+            txt = self.font.render(f"{shown}{suffix}", True, (245, 255, 220))
+            tx = display.centerx - txt.get_width() // 2
+            ty = display.centery - txt.get_height() // 2
+            self.screen.blit(txt, (tx, ty))
+            if cursor_on:
+                digit_surf = self.font.render(shown, True, (245, 255, 220))
+                cx = tx + digit_surf.get_width() + 1
+                pygame.draw.line(self.screen, (245, 255, 220), (cx, ty + 2), (cx, ty + txt.get_height() - 2), 1)
+        else:
+            txt = self.font.render(f"{bpm:03d} BPM", True, (226, 246, 242))
+            self.screen.blit(txt, (display.centerx - txt.get_width() // 2, display.centery - txt.get_height() // 2))
         for rect, direction in ((up, 1), (down, -1)):
             pygame.draw.rect(self.screen, (34, 52, 56), rect, border_radius=4)
             pygame.draw.rect(self.screen, (82, 132, 138), rect, width=1, border_radius=4)
@@ -1598,7 +1717,7 @@ class AudioLabApp:
 
         help_lines = [
             "mouse L: toggle note   mouse R: erase note",
-            "BPM: click counter / arrows / wheel; shift = x5",
+            "BPM: arrows/wheel nudge; double-click counter to type",
             "space play   enter render   ctrl+s save   ctrl+e export",
             "1-4 track   tab next   [/] waveform   R/P randomize",
             "JSON: tools/audio_lab_patches/",
