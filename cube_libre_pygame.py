@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.66-debug-console"
+version_number = "0.15.67-esc-confirm"
 
 import colorsys
 import importlib.util
@@ -392,7 +392,7 @@ TIME_BUZZER_COOLDOWN_SECONDS = 0.82
 # The alien-gamelan WAV is deliberately generated/copied from the safe old synth
 # and then raised as a source asset with a peak ceiling, instead of rewriting the
 # instrument into a clipped/distorted mess.
-GAMELAN_GAIN_DB = 0.0
+GAMELAN_GAIN_DB = 5.0
 GAMELAN_GAIN = 10.0 ** (GAMELAN_GAIN_DB / 20.0)
 GAMELAN_SOURCE_GAIN_DB = 12.0
 GAMELAN_SOURCE_GAIN = 10.0 ** (GAMELAN_SOURCE_GAIN_DB / 20.0)
@@ -1385,8 +1385,8 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
     draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] - 84)
 
     footer_font = get_font(13, False)
-    footer = footer_font.render("Esc = quit confirm from title / return to title in-game   ·   Goal: reach the portal with as many cubes intact as possible", True, (150, 190, 200))
-    shadow = footer_font.render("Esc = quit confirm from title / return to title in-game   ·   Goal: reach the portal with as many cubes intact as possible", True, (0, 0, 0))
+    footer = footer_font.render("Esc = quit confirm from title / menu confirm in-game   ·   Goal: reach the portal with as many cubes intact as possible", True, (150, 190, 200))
+    shadow = footer_font.render("Esc = quit confirm from title / menu confirm in-game   ·   Goal: reach the portal with as many cubes intact as possible", True, (0, 0, 0))
     footer_panel = pygame.Surface((min(DISPLAY[0] - 20, footer.get_width() + 20), footer.get_height() + 8), pygame.SRCALPHA)
     x = max(0, (footer_panel.get_width() - footer.get_width()) // 2)
     footer_panel.blit(shadow, (x + 1, 5))
@@ -1467,6 +1467,27 @@ def render_quit_confirm(t: float):
     pygame.draw.rect(panel, (255, 230, 120, 75 + int(105 * pulse)), panel.get_rect(), width=3, border_radius=16)
     draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2 + 150)
 
+def render_menu_confirm(t: float):
+    """In-run ESC confirmation before leaving the current attempt.
+
+    ESC used to dump the player straight back to the title screen, which is too
+    destructive during a deep run and too easy to hit by accident. Keep this as
+    a modal overlay instead of a new game_state so the current scene freezes
+    underneath it and can be resumed cleanly with N/Esc.
+    """
+    pulse = 0.55 + 0.45 * math.sin(t * 5.4)
+    panel = make_text_panel(
+        [
+            "Y = exit to main menu",
+            "N / Esc = continue run",
+        ],
+        title="EXIT TO MAIN MENU?",
+        footer="Current run/level state will be abandoned only if you choose Y.",
+        width=690,
+    )
+    pygame.draw.rect(panel, (255, 165, 90, 80 + int(110 * pulse)), panel.get_rect(), width=3, border_radius=16)
+    draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2 + 120)
+
 
 def render_reset_confirm(t: float, current_level: int, score: int):
     """Ctrl+R confirmation overlay.
@@ -1543,7 +1564,7 @@ def render_help_overlay(t: float, game_state: str, level: int):
         (body, "P                     pause / resume game and audio", (210, 235, 240), 304),
         (body, "L                     locate camera: center view on cube", (210, 235, 240), 328),
         (body, "Space / Enter         start from title or advance after transcendence", (210, 235, 240), 352),
-        (body, "Esc                   title screen / quit confirm", (210, 235, 240), 376),
+        (body, "Esc                   in-game menu confirm / title quit confirm", (210, 235, 240), 376),
         (body, "Alt+F, F11, Alt+Enter fullscreen / windowed", (210, 235, 240), 400),
         (body, "M                     mute / unmute", (210, 235, 240), 424),
         (body, "Ctrl+R                reset options", (210, 235, 240), 448),
@@ -6151,7 +6172,7 @@ def render_pause_overlay(t: float, locate_enabled: bool):
     s1 = font.render(text, True, green)
     draw_surface_2d(s1, DISPLAY[0] // 2, DISPLAY[1] // 2 - 22)
 
-    sub_text = f"P = resume     L = locate {'ON' if locate_enabled else 'OFF'}     H = help     ESC = title"
+    sub_text = f"P = resume     L = locate {'ON' if locate_enabled else 'OFF'}     H = help     ESC = menu confirm"
     for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         outline = small.render(sub_text, True, (0, 0, 0))
         draw_surface_2d(outline, DISPLAY[0] // 2 + ox, DISPLAY[1] // 2 + 42 + oy)
@@ -7002,6 +7023,8 @@ def main():
     pause_ui_t = 0.0
     reset_confirm_active = False
     reset_confirm_previous_paused = False
+    menu_confirm_active = False
+    menu_confirm_previous_paused = False
     locate_camera_enabled = AUTO_CENTER_ON_PLAYER
     spatial_mode_intro_seen = False
     space_intro_timer = 0.0
@@ -7014,6 +7037,7 @@ def main():
     # death/white-void reassembly, portal warp, input and scoring overlays from stomping on
     # each other.
     game_state = "title"  # title | quit_confirm | level_ready | space_intro | time_intro | course_materialize | playing | death_dissolve | reassembly | reassembly_flash | portal_warp | result_overlay
+    # menu_confirm_active is a modal overlay, not a game_state: it freezes the current run underneath it.
     death_timer = 0.0
     level_ready_timer = 0.0
     course_materialize_timer = 0.0
@@ -7263,11 +7287,41 @@ def main():
         else:
             begin_level_ready(target, f"LEVEL {target} GET READY")
 
+    def open_menu_confirm():
+        nonlocal menu_confirm_active, menu_confirm_previous_paused, paused, show_help_overlay, reset_confirm_active
+        if menu_confirm_active:
+            return
+        reset_confirm_active = False
+        menu_confirm_active = True
+        menu_confirm_previous_paused = paused
+        paused = True
+        show_help_overlay = False
+        audio_pause_all()
+        set_message("EXIT TO MAIN MENU? Y/N", 1.2)
+
+    def cancel_menu_confirm():
+        nonlocal menu_confirm_active, paused
+        menu_confirm_active = False
+        paused = menu_confirm_previous_paused
+        if not paused:
+            audio_resume_all()
+        set_message("MENU EXIT CANCELLED", 0.8)
+
+    def confirm_menu_exit():
+        nonlocal menu_confirm_active, menu_confirm_previous_paused, paused
+        menu_confirm_active = False
+        menu_confirm_previous_paused = False
+        paused = False
+        audio_resume_all()
+        return_to_title()
+
     def return_to_title():
         nonlocal game_state, death_timer, portal_warp_timer, win_overlay_timer, damage_timer, reassembly_particles, level_ready_timer, course_materialize_timer, recoupling_particles, recoupling_timer, recoupling_notice_timer, paused
-        nonlocal reset_confirm_active, reset_confirm_previous_paused
+        nonlocal reset_confirm_active, reset_confirm_previous_paused, menu_confirm_active, menu_confirm_previous_paused
         reset_confirm_active = False
         reset_confirm_previous_paused = False
+        menu_confirm_active = False
+        menu_confirm_previous_paused = False
         paused = False
         audio_resume_all()
         reassembly_particles = []
@@ -7685,6 +7739,15 @@ def main():
                     handle_debug_console_key(event)
                     continue
 
+                if menu_confirm_active:
+                    if event.key == pygame.K_y:
+                        confirm_menu_exit()
+                    elif event.key in (pygame.K_n, pygame.K_ESCAPE):
+                        cancel_menu_confirm()
+                    else:
+                        set_message("EXIT TO MAIN MENU? Y/N", 0.95)
+                    continue
+
                 if reset_confirm_active:
                     if event.key in (pygame.K_1, pygame.K_KP1):
                         confirm_reset_to_level_one()
@@ -7758,10 +7821,11 @@ def main():
                     if game_state == "title":
                         game_state = "quit_confirm"
                         set_message("QUIT? Y/N", 1.2)
+                    elif game_state == "quit_confirm":
+                        game_state = "title"
+                        set_message("QUIT CANCELLED", 0.8)
                     else:
-                        paused = False
-                        audio_resume_all()
-                        return_to_title()
+                        open_menu_confirm()
 
                 elif event.key == pygame.K_c:
                     if game_state == "playing" and not show_help_overlay:
@@ -8079,11 +8143,14 @@ def main():
                         else:
                             render_recoupling_recovery_prompt(player, t, recoupling_active=bool(recoupling_particles))
 
-        if paused and not debug_console_open:
+        if paused and not debug_console_open and not reset_confirm_active and not menu_confirm_active:
             render_pause_overlay(pause_ui_t, locate_camera_enabled)
 
         if reset_confirm_active:
             render_reset_confirm(pause_ui_t, current_level, score)
+
+        if menu_confirm_active:
+            render_menu_confirm(pause_ui_t)
 
         if show_help_overlay:
             render_help_overlay(t if not paused else pause_ui_t, game_state, current_level)
@@ -8113,7 +8180,7 @@ def main():
             pygame.display.set_caption(
                 f"Cube Libre v.{version_number} | state: {game_state} | level: {current_level} | intact: {player.intact_count():3d}/{MAX_CELLS} | "
                 f"score: {score} | best: {best_escape}/{MAX_CELLS} | highest level: {highest_level} | "
-                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc title/quit confirm | H help | ` / Ctrl+Shift+F1 console | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset options{msg}"
+                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc menu/quit confirm | H help | ` / Ctrl+Shift+F1 console | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset options{msg}"
             )
             caption_timer = 0.12
 
