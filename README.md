@@ -60,10 +60,10 @@ From the repository root:
 python cube_libre_pygame.py
 ```
 
-If you are using a dated prototype file directly, run that file instead, for example:
+or:
 
-```bash
-python cube_libre_recouple_gather_rate.py
+```
+./cube_libre_pygame.py
 ```
 
 The game generates procedural sound files on first run under a local sound/effects directory. This first run may take slightly longer depending on the current prototype branch.
