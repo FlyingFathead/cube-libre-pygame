@@ -194,6 +194,7 @@ LEVEL_READY_FADE_IN_SECONDS = 0.95
 AUDIO_ENABLED = True
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_DIR_NAME = os.path.join("assets", "sfx")
+AUDIO_DIR_LABEL = "assets/sfx"
 # First-run audio rendering is CPU-heavy pure Python. Keep it out of the
 # Pygame process so Linux/Wayland/GNOME does not think the window has frozen
 # while the WAV cache is being built.
@@ -611,7 +612,7 @@ def get_dotmatrix_font():
     """Load the optional procedural dot-matrix font once, or return None.
 
     Runtime files expected in the repository root/layout:
-      - cube_libre/dotmatrix_font.py
+      - _cube_libre/dotmatrix_font.py
       - assets/fonts/cube_libre_5x7.json
 
     The standalone editor is also checked so local builds warn if the generator
@@ -623,7 +624,7 @@ def get_dotmatrix_font():
     _dotmatrix_checked = True
 
     try:
-        from cube_libre.dotmatrix_font import DotMatrixFont
+        from _cube_libre.dotmatrix_font import DotMatrixFont
     except Exception as exc:
         _warn_dotmatrix(f"could not import dotmatrix_font.py ({exc.__class__.__name__}: {exc})")
         return None
@@ -1375,7 +1376,7 @@ def render_audio_setup_overlay(t: float):
         border = (0, 235, 245, 138 + int(82 * pulse))
         title_text = "FIRST RUN SETUP"
         body_1 = "Audio assets not found. Rendering procedural sound cache..."
-        body_2 = f"{AUDIO_DIR_NAME}/ will be reused on later runs."
+        body_2 = f"{AUDIO_DIR_LABEL} will be reused on later runs."
         body_3 = "Please wait. Start is locked until setup is ready."
 
     pygame.draw.rect(panel, border, panel.get_rect(), width=2, border_radius=18)

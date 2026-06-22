@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from typing import List, Optional, Tuple
 
-from cube_libre.dotmatrix_font import DEFAULT_CHARSET, DotMatrixFont, blank_glyph, normalize_glyph
+from _cube_libre.dotmatrix_font import DEFAULT_CHARSET, DotMatrixFont, blank_glyph, normalize_glyph
 
 BG = (13, 14, 22)
 PANEL = (24, 26, 40)
