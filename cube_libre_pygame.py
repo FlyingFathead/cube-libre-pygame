@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.67-esc-confirm"
+version_number = "0.15.69-reset-modfix"
 
 import colorsys
 import importlib.util
@@ -129,11 +129,15 @@ PLAYER_CENTER_ZOOM = 48.0
 # deliberately left alone; the draw-call tax is mostly geometry, not 900 points.
 PREVIEW_MODULES_AHEAD = 1
 
-# Reset safety. Plain R used to restart the whole run from level 1, which is
-# too easy to hit accidentally while playing near E/D/Q/W. During an active
-# run, require Ctrl+R for the destructive full-run reset. Title/result screens
-# can still start/reset normally.
-RUN_RESET_REQUIRES_CTRL_DURING_PLAY = True
+# Reset safety / keybind. Plain R used to restart the whole run from level 1,
+# which is too easy to hit accidentally while playing near E/D/Q/W. Keep the
+# destructive reset-options chord here with the other startup tuning knobs.
+# Pygame modifier bits are checked as a subset so NumLock/CapsLock do not break it;
+# Alt is intentionally rejected to avoid desktop/window-manager collisions.
+RESET_OPTIONS_KEY = pygame.K_F2
+RESET_OPTIONS_MODS = pygame.KMOD_CTRL | pygame.KMOD_SHIFT
+RESET_OPTIONS_LABEL = "Ctrl+Shift+F2"
+RESET_OPTIONS_DISALLOW_MODS = pygame.KMOD_ALT
 
 # In-game developer/debug console. Enabled by default for prototype iteration.
 # Primary key is the classic console/backquote key; Ctrl+Shift+F1 is kept as a
@@ -1375,7 +1379,7 @@ def render_title_help(t: float, score: int, best_escape: int, highest_level: int
 
     lines = [
         (small.render("A/D or ←/→: move X    W/S or ↑/↓: move Y", True, (210, 235, 240)), 12),
-        (small.render("Q/E: move Z    Hold Shift for rush    Ctrl+R = reset options    M = mute", True, (210, 235, 240)), 38),
+        (small.render(f"Q/E: move Z    Hold Shift for rush    {RESET_OPTIONS_LABEL} = reset options    M = mute", True, (210, 235, 240)), 38),
         (tiny.render("Alt+F / F11 / Alt+Enter = fullscreen    H = help overlay", True, (178, 222, 230)), 66),
         (stat.render(f"Score: {score}     Best escape: {best_escape}/{MAX_CELLS} cubes     Highest level: {highest_level}", True, (165, 205, 218)), 89),
     ]
@@ -1490,7 +1494,7 @@ def render_menu_confirm(t: float):
 
 
 def render_reset_confirm(t: float, current_level: int, score: int):
-    """Ctrl+R confirmation overlay.
+    """Reset-options confirmation overlay.
 
     Reset is destructive enough that it should never instantly throw a level-6
     run back to level 1. Ask whether the player wants a full run reset, a
@@ -1526,7 +1530,7 @@ def render_reset_confirm(t: float, current_level: int, score: int):
         panel.blit(body_s, (x + 112, y + 2))
         y += 38
 
-    footer = tiny.render(f"Current score: {score}   ·   Ctrl+R opened this screen", True, (155, 190, 198))
+    footer = tiny.render(f"Current score: {score}   ·   {RESET_OPTIONS_LABEL} opened this screen", True, (155, 190, 198))
     panel.blit(footer, ((panel.get_width() - footer.get_width()) // 2, panel.get_height() - 30))
     draw_surface_2d(panel, DISPLAY[0] // 2, DISPLAY[1] // 2 + 90)
 
@@ -1567,7 +1571,7 @@ def render_help_overlay(t: float, game_state: str, level: int):
         (body, "Esc                   in-game menu confirm / title quit confirm", (210, 235, 240), 376),
         (body, "Alt+F, F11, Alt+Enter fullscreen / windowed", (210, 235, 240), 400),
         (body, "M                     mute / unmute", (210, 235, 240), 424),
-        (body, "Ctrl+R                reset options", (210, 235, 240), 448),
+        (body, f"{RESET_OPTIONS_LABEL:<21} reset options", (210, 235, 240), 448),
     ]
     for font, text, color, y in rows:
         s = font.render(text, True, color)
@@ -1598,6 +1602,42 @@ def debug_flag_enabled(name: str, default: bool = True) -> bool:
 
 def debug_bool_text(value) -> str:
     return "ON" if bool(value) else "OFF"
+
+
+def is_reset_options_key(key, mods) -> bool:
+    """Return True when the configured reset-options key chord is pressed.
+
+    Pygame's aggregate modifier constants are traps: KMOD_CTRL is
+    KMOD_LCTRL | KMOD_RCTRL, and KMOD_SHIFT is KMOD_LSHIFT | KMOD_RSHIFT.
+    A strict subset test would require both left+right Ctrl and both
+    left+right Shift at once. Treat aggregate Ctrl/Shift/Alt requirements
+    as "any Ctrl/Shift/Alt key is down," the same way the debug-console
+    Ctrl+Shift+F1 fallback does.
+    """
+    if key != RESET_OPTIONS_KEY:
+        return False
+
+    mods = int(mods)
+    required = int(RESET_OPTIONS_MODS)
+    disallowed = int(RESET_OPTIONS_DISALLOW_MODS)
+
+    if disallowed and (mods & disallowed):
+        return False
+
+    aggregate = int(pygame.KMOD_CTRL | pygame.KMOD_SHIFT | pygame.KMOD_ALT)
+
+    if (required & pygame.KMOD_CTRL) and not (mods & pygame.KMOD_CTRL):
+        return False
+    if (required & pygame.KMOD_SHIFT) and not (mods & pygame.KMOD_SHIFT):
+        return False
+    if (required & pygame.KMOD_ALT) and not (mods & pygame.KMOD_ALT):
+        return False
+
+    other_required = required & ~aggregate
+    if other_required and (mods & other_required) != other_required:
+        return False
+
+    return True
 
 
 def debug_parse_bool_token(value):
@@ -7864,21 +7904,16 @@ def main():
                     else:
                         set_message("RE-COUPLING UNAVAILABLE", 0.55)
 
-                elif event.key == pygame.K_r:
-                    # Keep R as an explicit reset/debug key, but never let an
-                    # accidental R tap during active play throw a deep run back
-                    # to level 1. During a run, plain R only reminds the player;
-                    # Ctrl+R opens a confirmation with full-run/current-level/cancel.
+                elif is_reset_options_key(event.key, mods):
+                    # Configurable reset-options chord. This used to live on
+                    # the old R-based chord, but R sits too close to normal movement keys and
+                    # is too easy to hit while playing.
                     active_run_states = (
                         "level_ready", "space_intro", "time_intro", "course_materialize", "playing",
                         "death_dissolve", "reassembly", "reassembly_flash", "portal_warp",
                     )
-                    ctrl_down = bool(mods & pygame.KMOD_CTRL)
                     if game_state in active_run_states:
-                        if RUN_RESET_REQUIRES_CTRL_DURING_PLAY and not ctrl_down:
-                            set_message("CTRL+R = RESET OPTIONS", 0.85)
-                        else:
-                            open_reset_confirm()
+                        open_reset_confirm()
                     else:
                         start_new_run("RESET RUN")
 
@@ -8180,7 +8215,7 @@ def main():
             pygame.display.set_caption(
                 f"Cube Libre v.{version_number} | state: {game_state} | level: {current_level} | intact: {player.intact_count():3d}/{MAX_CELLS} | "
                 f"score: {score} | best: {best_escape}/{MAX_CELLS} | highest level: {highest_level} | "
-                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc menu/quit confirm | H help | ` / Ctrl+Shift+F1 console | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, Ctrl+R reset options{msg}"
+                f"Space/Enter title/next level | P pause | L locate {'ON' if locate_camera_enabled else 'OFF'} | Esc menu/quit confirm | H help | ` / Ctrl+Shift+F1 console | Alt+F/F11 fullscreen | M mute | A/D X, W/S Y, Q/E Z, Shift rush, C re-couple limited, {RESET_OPTIONS_LABEL} reset options{msg}"
             )
             caption_timer = 0.12
 
