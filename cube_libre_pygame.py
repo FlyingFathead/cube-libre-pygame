@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.76-boundary heat tuning"
+version_number = "0.15.77-ember fragments"
 
 import colorsys
 import importlib.util
@@ -1858,6 +1858,10 @@ class Fragment:
     rot_angle: float
     angular_vel: float
     age: float = 0.0
+    # Heat captured at the instant the cell is knocked loose. This makes
+    # boundary-overheat chunks stay ember-hot even if the player immediately
+    # re-enters the course and the main cube starts cooling blue.
+    thermal_heat: float = 0.0
 
     def update(self, dt: float):
         self.age += dt
@@ -2411,6 +2415,7 @@ class PlayerCube:
                 rot_axis=random_vec(1.0).normalized(),
                 rot_angle=random.uniform(0, 360),
                 angular_vel=random.uniform(-280, 280),
+                thermal_heat=clamp(float(globals().get("BOUNDARY_HEAT_VISUAL", 0.0)), 0.0, 1.0),
             )
         )
         return True
@@ -4334,11 +4339,18 @@ def draw_player(player: PlayerCube, absorb_portal_cells: bool = False, t: float 
         # Blinking expired-ish cubes get a faint outline so the player sees
         # the last chance to hit C before that chunk is gone for the level.
         draw_unit_cube(frag_color, alpha, outline=(f.expiry_warning or frag_outline is not None), outline_color=frag_outline)
-        if BOUNDARY_HEAT_VISUAL > 0.03 and f.expiry_ratio < 0.72:
+        ember_heat = fragment_ember_heat(f)
+        if ember_heat > 0.03 and f.expiry_ratio < 0.78:
             pulse = 0.5 + 0.5 * math.sin(t * math.tau * 7.4 + f.rot_angle * 0.017)
+            ember_alive = 1.0 - smoothstep((f.expiry_ratio - 0.08) / 0.62)
             glBlendFunc(GL_SRC_ALPHA, GL_ONE)
-            glScalef(1.05 + 0.06 * BOUNDARY_HEAT_VISUAL, 1.05 + 0.06 * BOUNDARY_HEAT_VISUAL, 1.05 + 0.06 * BOUNDARY_HEAT_VISUAL)
-            draw_unit_cube((1.0, 0.11 + 0.28 * pulse, 0.02), 0.05 + 0.17 * BOUNDARY_HEAT_VISUAL * (1.0 - f.expiry_ratio), outline=False)
+            bloom = 1.05 + 0.085 * ember_heat * ember_alive
+            glScalef(bloom, bloom, bloom)
+            draw_unit_cube(
+                (1.0, 0.10 + 0.32 * pulse, 0.015),
+                (0.045 + 0.24 * ember_heat) * ember_alive,
+                outline=False,
+            )
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glPopMatrix()
     glDisable(GL_BLEND)
@@ -4440,6 +4452,26 @@ def set_boundary_thermal_visual(heat: float = 0.0, cool: float = 0.0):
     BOUNDARY_COOL_VISUAL = clamp(float(cool), 0.0, 1.0)
 
 
+def fragment_ember_heat(fragment: Fragment) -> float:
+    """Persistent ember heat for loose chunks born during boundary overheat."""
+    born_heat = clamp(float(getattr(fragment, "thermal_heat", 0.0)), 0.0, 1.0)
+    if born_heat <= 0.005:
+        return clamp(BOUNDARY_HEAT_VISUAL, 0.0, 1.0)
+
+    # Keep a newly-sheared cubelet visibly molten for a short beat, then let it
+    # cool into the normal ash-grey fragment fade. This is intentionally based
+    # on fragment age, not current player heat, so pieces remain ember-like after
+    # the main cube gets back inside and cools.
+    life = fragment.expiry_ratio
+    ember_hold = 0.12
+    ember_fade_end = 0.58
+    if life <= ember_hold:
+        retained = 1.0
+    else:
+        retained = 1.0 - smoothstep((life - ember_hold) / max(0.001, ember_fade_end - ember_hold))
+    return max(clamp(BOUNDARY_HEAT_VISUAL, 0.0, 1.0), born_heat * retained)
+
+
 def fragment_thermal_tint(fragment: Fragment, t: float):
     """Hot fragments glow while newly knocked off, then return to normal fade.
 
@@ -4447,21 +4479,29 @@ def fragment_thermal_tint(fragment: Fragment, t: float):
     permanently red; they leave the cube red-hot and end up grey/ashy.
     """
     base = fragment_fade_color(fragment)
-    heat = clamp(BOUNDARY_HEAT_VISUAL, 0.0, 1.0)
+    heat = fragment_ember_heat(fragment)
     if heat <= 0.005:
         return base, None
 
-    young = smoothstep((0.78 - fragment.expiry_ratio) / 0.78)
+    young = smoothstep((0.86 - fragment.expiry_ratio) / 0.86)
     if young <= 0.005:
         return base, None
 
     pulse = 0.5 + 0.5 * math.sin(t * math.tau * (5.8 + 2.5 * heat) + fragment.rot_angle * 0.011)
-    hot = (1.0, 0.10 + 0.32 * pulse, 0.02)
-    white_hot = (1.0, 0.78, 0.28)
-    hot = tuple(hot[i] * (1.0 - 0.22 * pulse) + white_hot[i] * (0.22 * pulse) for i in range(3))
-    mix = clamp((0.35 + 0.50 * heat) * young, 0.0, 0.90)
-    color = tuple(base[i] * (1.0 - mix) + hot[i] * mix for i in range(3))
-    outline = (1.0, 0.30 + 0.45 * pulse, 0.03) if mix > 0.22 else None
+
+    # Blackened-hot ember: the fragment body is dark/scorched, with red-orange
+    # and yellow-white heat pushing through it. This reads less like a normal
+    # colored cube and more like a chunk of overheated metal/coal flying off.
+    scorched = (0.055, 0.030, 0.018)
+    ember = (1.0, 0.12 + 0.34 * pulse, 0.018)
+    white_hot = (1.0, 0.72, 0.20)
+    hot = tuple(ember[i] * (1.0 - 0.18 * pulse) + white_hot[i] * (0.18 * pulse) for i in range(3))
+
+    scorch_mix = clamp((0.18 + 0.42 * heat) * young, 0.0, 0.64)
+    hot_mix = clamp((0.38 + 0.48 * heat) * young, 0.0, 0.92)
+    darkened = tuple(base[i] * (1.0 - scorch_mix) + scorched[i] * scorch_mix for i in range(3))
+    color = tuple(darkened[i] * (1.0 - hot_mix) + hot[i] * hot_mix for i in range(3))
+    outline = (1.0, 0.24 + 0.48 * pulse, 0.02) if hot_mix > 0.18 else None
     return color, outline
 
 
