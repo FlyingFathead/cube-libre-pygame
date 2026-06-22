@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.70-perf-window"
+version_number = "0.15.72-preview timer fix"
 
 import colorsys
 import importlib.util
@@ -220,7 +220,17 @@ REASSEMBLY_SETTLE_DONE_AT = 0.88
 REASSEMBLY_INVERT_FLASH_ENABLED = True
 REASSEMBLY_INVERT_START_AT = 0.91
 REASSEMBLY_FLASH_SECONDS = 1.10
-COURSE_MATERIALIZE_SECONDS = 2.20
+# Level-start preview / materialization. This is intentionally configurable: the
+# transition is part of the game feel, not just a loading pause. During this
+# window the camera starts near the newly assembling player cube, zooms out to
+# show the route and the portal, then releases control.
+LEVEL_PREVIEW_SECONDS = 7.0
+LEVEL_PREVIEW_START_ZOOM = 27.5
+LEVEL_PREVIEW_ZOOM_PADDING = 1.22
+LEVEL_PREVIEW_MAX_ZOOM = 150.0
+LEVEL_PREVIEW_ROUTE_GHOST_ALPHA = 0.18
+LEVEL_PREVIEW_TETHER_ALPHA = 0.22
+COURSE_MATERIALIZE_SECONDS = LEVEL_PREVIEW_SECONDS
 PORTAL_WARP_SECONDS = 3.4
 TRANSCENDENCE_WHITE_SECONDS = 4.25
 LEVEL_READY_FADE_IN_SECONDS = 0.95
@@ -4827,86 +4837,314 @@ def draw_materializing_portal(t: float, progress: float):
     glPopMatrix()
 
 
+def _preview_cell_seed(cell) -> int:
+    x, y, z = cell
+    return 7301 + (x + 8) * 92821 + (y + 8) * 68917 + (z + 8) * 19391
+
+
+def _preview_player_cloud_pos(player: PlayerCube, cell, idx: int) -> Vec3:
+    """Stable incoming position for one pre-level assembly cube.
+
+    The intro should read like grey raw matter being pulled into the player body,
+    not like the normal coloured cube simply pops on. Keep this deterministic so
+    the animation feels authored rather than noisy.
+    """
+    rnd = random.Random(_preview_cell_seed(cell) + idx * 17)
+    angle = rnd.random() * math.tau
+    radius = rnd.uniform(6.5, 16.5)
+    height = rnd.uniform(-7.5, 7.5)
+    # Bias the cloud slightly backward/left of the spawn, so the finished cube
+    # has a visible arrival direction before it locks into the start position.
+    return player.origin + Vec3(
+        -10.0 - rnd.random() * 10.0 + math.cos(angle) * radius * 0.38,
+        height + math.sin(angle * 0.7) * 2.0,
+        math.sin(angle) * radius,
+    )
+
+
 def draw_materializing_player(player: PlayerCube, t: float, progress: float):
-    p = clamp(progress, 0.0, 1.0)
-    if p <= 0.46:
+    """Stylized level-start body assembly from loose grey mini-cubes.
+
+    This replaces the old center-point pop-in. The body starts as drifting grey
+    cubes, folds into the 5x5x5 player cube, then colour floods in right before
+    gameplay begins.
+    """
+    if player is None:
         return
-    source = player.origin
+    p = clamp(progress, 0.0, 1.0)
+    if p <= 0.001:
+        return
+
     cells = sorted(player.alive_cells)
+    if not cells:
+        return
+
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    assemble_window_start = 0.04
+    assemble_window_end = 0.78
+    colour_start = 0.54
+    lock_pulse = smoothstep((p - 0.72) / 0.20)
+
     for idx, cell in enumerate(cells):
-        delay = 0.46 + (((idx * 23) % 100) / 100.0) * 0.28
-        local_p = smoothstep((p - delay) / max(0.001, 1.0 - delay))
+        rnd = random.Random(_preview_cell_seed(cell))
+        delay = assemble_window_start + (((idx * 29) % 100) / 100.0) * 0.24
+        local_p = clamp((p - delay) / max(0.001, assemble_window_end - delay), 0.0, 1.0)
         if local_p <= 0.001:
+            # A few early ghost dots/cubes hanging in the cloud make the coming
+            # assembly readable before the actual pull starts.
+            if p < 0.18 and idx % 5 == 0:
+                ghost = _preview_player_cloud_pos(player, cell, idx)
+                glPushMatrix()
+                glTranslatef(ghost.x, ghost.y, ghost.z)
+                glRotatef(t * 24.0 + rnd.uniform(0.0, 360.0), rnd.random(), rnd.random(), rnd.random())
+                s = 0.22 + 0.10 * math.sin(t * 3.0 + idx)
+                glScalef(s, s, s)
+                draw_unit_cube((0.48, 0.50, 0.52), 0.10, outline=True, outline_color=(0.72, 0.74, 0.76))
+                glPopMatrix()
             continue
+
+        u = smoothstep(local_p)
+        start = _preview_player_cloud_pos(player, cell, idx)
         target = player.cell_world_pos(cell)
-        pos = _lerp_vec(source, target, local_p)
-        spin = (1.0 - local_p) * (220.0 + ((idx * 19) % 90))
-        scale = 0.10 + 0.90 * local_p
+
+        # Curved approach: loose cubes arc around the player origin before
+        # snapping into their exact local slots.
+        swirl = math.sin(u * math.pi) * (1.0 - u) * 2.4
+        swirl_vec = Vec3(
+            math.sin(t * 1.9 + idx * 0.37) * swirl,
+            math.cos(t * 1.6 + idx * 0.29) * swirl * 0.55,
+            math.cos(t * 2.1 + idx * 0.43) * swirl,
+        )
+        pos = _lerp_vec(start, target, u) + swirl_vec
+
+        # Raw grey construction matter becomes the proper player gradient late.
+        grey_level = 0.38 + 0.24 * rnd.random()
+        grey = (grey_level, grey_level * 1.02, grey_level * 1.08)
+        target_color = player.color_for_cell(cell)
+        colour_p = smoothstep((p - colour_start) / 0.34)
+        color = tuple(grey[i] * (1.0 - colour_p) + target_color[i] * colour_p for i in range(3))
+
+        # The assembled cube briefly flashes white/cyan as the last cells lock.
+        lock_flash = max(0.0, 1.0 - abs(p - 0.82) / 0.10) * 0.34
+        color = tuple(color[i] * (1.0 - lock_flash) + 1.0 * lock_flash for i in range(3))
+
+        rot_axis = Vec3(rnd.uniform(-1.0, 1.0), rnd.uniform(-1.0, 1.0), rnd.uniform(-1.0, 1.0)).normalized()
+        spin = (1.0 - u) * (520.0 + ((idx * 31) % 220)) + t * 28.0 * (1.0 - lock_pulse)
+        scale = 0.28 + 0.72 * u
+        alpha = 0.18 + 0.82 * smoothstep(local_p)
+
         glPushMatrix()
         glTranslatef(pos.x, pos.y, pos.z)
-        glRotatef(spin + t * 35.0, 1.0, 0.7, 0.25)
+        glRotatef(spin, rot_axis.x, rot_axis.y, rot_axis.z)
         glScalef(scale, scale, scale)
-        draw_unit_cube(player.color_for_cell(cell), 0.18 + 0.82 * local_p, outline=True)
+        draw_unit_cube(color, alpha, outline=True, outline_color=(0.0, 0.0, 0.0))
         glPopMatrix()
-    glDisable(GL_BLEND)
 
+    # A subtle construction cage around the finished body. It helps the eye read
+    # the exact playable object before the camera hands control to the player.
+    cage_p = smoothstep((p - 0.64) / 0.22)
+    if cage_p > 0.01:
+        half_span = (CUBE_SIZE // 2) * CELL_SPACING + CELL_HALF * 1.14
+        pulse = 0.5 + 0.5 * math.sin(t * 9.0)
+        glColor4f(0.78, 0.95, 1.0, (1.0 - smoothstep((p - 0.88) / 0.10)) * (0.16 + 0.22 * pulse) * cage_p)
+        glLineWidth(1.4 + 2.2 * pulse)
+        glPushMatrix()
+        glTranslatef(player.origin.x, player.origin.y, player.origin.z)
+        draw_wire_box(-half_span, half_span, -half_span, half_span, -half_span, half_span)
+        glPopMatrix()
+
+    glDisable(GL_BLEND)
 
 def render_materialization_overlay(t: float, progress: float):
     p = clamp(progress, 0.0, 1.0)
-    surf = pygame.Surface((520, 76), pygame.SRCALPHA)
-    pulse = 0.5 + 0.5 * math.sin(t * 7.0)
-    pygame.draw.rect(surf, (0, 0, 0, 95), surf.get_rect(), border_radius=14)
-    pygame.draw.rect(surf, (0, 230, 245, 95 + int(75 * pulse)), surf.get_rect(), width=2, border_radius=14)
-    font = get_font(24, True)
+    surf = pygame.Surface((680, 96), pygame.SRCALPHA)
+    pulse = 0.5 + 0.5 * math.sin(t * 6.0)
+    pygame.draw.rect(surf, (0, 0, 0, 118), surf.get_rect(), border_radius=16)
+    pygame.draw.rect(surf, (0, 230, 245, 100 + int(72 * pulse)), surf.get_rect(), width=2, border_radius=16)
+    font = get_font(25, True)
     small = get_font(15, False)
-    tr, tg, tb = [int(v * 255) for v in _hsv(0.50 + t * 0.08, 0.58, 1.0)]
-    label = font.render(f"LEVEL {ACTIVE_LEVEL} FIELD MATERIALIZING", True, (tr, tg, tb))
-    sub = small.render("structures plotted from singular points", True, (190, 225, 232))
+    tiny = get_font(13, False)
+    tr, tg, tb = [int(v * 255) for v in _hsv(0.50 + t * 0.07, 0.54, 1.0)]
+    label = font.render(f"LEVEL {ACTIVE_LEVEL} PREVIEW", True, (tr, tg, tb))
+    if p < 0.45:
+        sub_text = "assembling player body from grey cube matter"
+    elif p < 0.76:
+        sub_text = "route and portal resolving in rotating field"
+    else:
+        sub_text = "field lock complete — control imminent"
+    sub = small.render(sub_text, True, (200, 232, 238))
+    duration = tiny.render(f"field coherence: {int(p * 100):03d}%", True, (145, 190, 198))
     surf.blit(label, ((surf.get_width() - label.get_width()) // 2, 10))
     surf.blit(sub, ((surf.get_width() - sub.get_width()) // 2, 42))
+    surf.blit(duration, ((surf.get_width() - duration.get_width()) // 2, 70))
     # Progress rail
-    bar_x, bar_y, bar_w, bar_h = 64, 62, 392, 4
+    bar_x, bar_y, bar_w, bar_h = 64, 90, 552, 4
     pygame.draw.rect(surf, (45, 65, 72, 180), (bar_x, bar_y, bar_w, bar_h), border_radius=3)
-    pygame.draw.rect(surf, (0, 230, 245, 210), (bar_x, bar_y, int(bar_w * p), bar_h), border_radius=3)
-    draw_surface_2d(surf, DISPLAY[0] // 2, DISPLAY[1] - 74)
+    pygame.draw.rect(surf, (0, 230, 245, 220), (bar_x, bar_y, int(bar_w * p), bar_h), border_radius=3)
+    draw_surface_2d(surf, DISPLAY[0] // 2, DISPLAY[1] - 80)
 
+
+def course_preview_center_and_zoom():
+    """Camera target for the readable level preview.
+
+    The normal camera is allowed to be player-centered for performance/readability
+    during play. The intro uses a wider route camera so the player can actually
+    see the upcoming route and the portal before control is released.
+    """
+    xmin, xmax, ymin, ymax, zmin, zmax = course_aabb(0.0)
+    if PORTAL_MODULE is not None:
+        px, py, pz = PORTAL_POSITION
+        xmin, xmax = min(xmin, px), max(xmax, px)
+        ymin, ymax = min(ymin, py), max(ymax, py)
+        zmin, zmax = min(zmin, pz), max(zmax, pz)
+    center = Vec3((xmin + xmax) * 0.5, (ymin + ymax) * 0.5, (zmin + zmax) * 0.5)
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+    span_z = zmax - zmin
+    # With a 45-degree perspective and 1000x760-ish aspect, this gives a wider
+    # intro view than normal play without pushing beyond the existing far plane.
+    span = max(span_x * 0.62, span_y * 0.90, span_z * 0.90, 46.0)
+    zoom = clamp(span * LEVEL_PREVIEW_ZOOM_PADDING + 20.0, 48.0, LEVEL_PREVIEW_MAX_ZOOM)
+    return center, zoom
+
+
+def preview_camera_for_player(player: PlayerCube, progress: float):
+    route_center, route_zoom = course_preview_center_and_zoom()
+    if player is None:
+        return route_center, route_zoom
+    p = clamp(progress, 0.0, 1.0)
+    # Spend the first beat close to the forming cube, then pull back decisively.
+    zoom_out = smoothstep(clamp((p - 0.10) / 0.58, 0.0, 1.0))
+    start_center = player.origin
+    center = _lerp_vec(start_center, route_center, zoom_out)
+    zoom = LEVEL_PREVIEW_START_ZOOM * (1.0 - zoom_out) + route_zoom * zoom_out
+    # Final tiny settle backward so the portal/route stay visible at handoff.
+    zoom += math.sin(clamp((p - 0.70) / 0.30, 0.0, 1.0) * math.pi) * 3.5
+    return center, zoom
+
+
+def draw_preview_route_ghost(progress: float, t: float):
+    """Readable grey whole-route scaffold under the materialization effects."""
+    p = smoothstep(clamp(progress, 0.0, 1.0))
+    alpha = LEVEL_PREVIEW_ROUTE_GHOST_ALPHA * (0.28 + 0.72 * p)
+    if alpha <= 0.001:
+        return
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    glColor4f(0.42, 0.44, 0.48, alpha)
+    glLineWidth(1.0)
+    glBegin(GL_LINES)
+    for a, b in _course_box_segments():
+        glVertex3f(a.x, a.y, a.z)
+        glVertex3f(b.x, b.y, b.z)
+    glEnd()
+
+    if p > 0.16:
+        glColor4f(0.27, 0.29, 0.34, alpha * 0.64)
+        glLineWidth(0.8)
+        glBegin(GL_LINES)
+        for a, b in _course_guide_segments():
+            glVertex3f(a.x, a.y, a.z)
+            glVertex3f(b.x, b.y, b.z)
+        glEnd()
+
+    glDisable(GL_BLEND)
+
+
+def draw_preview_portal_tether(player: PlayerCube, progress: float, t: float):
+    """Faint temporary destination line so the exit reads in the preview."""
+    if player is None or progress <= 0.08:
+        return
+    p = smoothstep(clamp((progress - 0.08) / 0.52, 0.0, 1.0))
+    alpha = LEVEL_PREVIEW_TETHER_ALPHA * p * (0.70 + 0.30 * math.sin(t * 5.0) ** 2)
+    portal = Vec3(*PORTAL_POSITION)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glLineWidth(1.2 + 1.4 * math.sin(p * math.pi))
+    glBegin(GL_LINES)
+    # Segmented line; intentionally a preview-only compass/tether, not gameplay steering.
+    segments = 18
+    for i in range(segments):
+        if i % 2:
+            continue
+        a = i / segments
+        b = (i + 0.72) / segments
+        pa = _lerp_vec(player.origin, portal, a)
+        pb = _lerp_vec(player.origin, portal, b)
+        rr, gg, bb = _hsv(0.50 + i * 0.011 + t * 0.03, 0.45, 1.0)
+        glColor4f(rr, gg, bb, alpha)
+        glVertex3f(pa.x, pa.y, pa.z)
+        glVertex3f(pb.x, pb.y, pb.z)
+    glEnd()
+    glDisable(GL_BLEND)
 
 def draw_course_materialization_scene(player: PlayerCube, t: float, scene_angles, progress: float):
-    """Start-run transition: stars first, then the field draws itself in from points."""
+    """Readable level preview: body assembly, zoom-out, route, portal, then play."""
     progress = clamp(progress, 0.0, 1.0)
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     glMatrixMode(GL_MODELVIEW)
     glLoadIdentity()
 
-    center, zoom = course_center_and_zoom()
+    center, zoom = preview_camera_for_player(player, progress)
     glTranslatef(0.0, 0.0, -zoom)
-    glRotatef(scene_angles[0], 1, 0, 0)
-    glRotatef(scene_angles[1], 0, 1, 0)
-    glRotatef(scene_angles[2], 0, 0, 1)
+
+    # Keep the global rotating-field feel, but add a slow authored reveal orbit.
+    reveal = smoothstep(progress)
+    intro_pitch = scene_angles[0] + math.sin(progress * math.pi) * 10.0
+    intro_yaw = scene_angles[1] - (1.0 - reveal) * 30.0 + math.sin(t * 0.35) * 2.0
+    intro_roll = scene_angles[2] + math.sin(progress * math.pi * 1.25) * 5.0
+    glRotatef(intro_pitch, 1, 0, 0)
+    glRotatef(intro_yaw, 0, 1, 0)
+    glRotatef(intro_roll, 0, 0, 1)
     glTranslatef(-center.x, -center.y, -center.z)
 
     draw_stars()
 
     p = smoothstep(progress)
-    draw_materializing_course_frame(clamp(p / 0.72, 0.0, 1.0), t)
 
-    materialize_lasers = [laser for laser in LASERS if getattr(laser, "module_index", 0) < MATERIALIZE_LASER_MODULES]
-    for idx, laser in enumerate(materialize_lasers):
-        laser_p = clamp((p - 0.12 - idx * 0.065) / 0.58, 0.0, 1.0)
-        draw_materializing_laser_grid(laser, t, laser_p)
+    # First: readable grey scaffold of the entire route. This fixes the old
+    # "singularity spaghetti" intro where the player could not tell where to go.
+    draw_preview_route_ghost(p, t)
 
-    portal_p = clamp((p - 0.34) / 0.58, 0.0, 1.0)
+    # Then plot the route lines in cyan, but slower and less abstract than before.
+    draw_materializing_course_frame(clamp((p - 0.08) / 0.62, 0.0, 1.0), t)
+
+    # Show the portal early enough that it becomes the visual destination.
+    draw_preview_portal_tether(player, p, t)
+    portal_p = clamp((p - 0.22) / 0.58, 0.0, 1.0)
     draw_materializing_portal(t, portal_p)
+    if p > 0.70:
+        draw_portal(t, portal_charge=0.10 + 0.18 * smoothstep((p - 0.70) / 0.30))
 
-    player_p = clamp((p - 0.40) / 0.60, 0.0, 1.0)
-    draw_materializing_player(player, t, player_p)
+    # Hazard preview: all modules get at least a faint resolved cue during the
+    # intro, unlike gameplay where future hazards are culled for performance.
+    for idx, laser in enumerate(LASERS):
+        module_idx = getattr(laser, "module_index", 0)
+        if p < 0.26:
+            continue
+        delay = 0.24 + module_idx * 0.045 + (idx % max(1, len(BASE_LASER_TEMPLATES))) * 0.018
+        laser_p = clamp((p - delay) / 0.48, 0.0, 1.0)
+        if laser_p <= 0.001:
+            continue
+        if module_idx >= MATERIALIZE_LASER_MODULES:
+            # Distant modules: grey marker first, then a restrained red shimmer.
+            draw_future_laser_marker(laser, t, alpha=0.055 + 0.075 * laser_p)
+            if laser_p > 0.55:
+                draw_revealing_laser_grid(laser, t, smoothstep((laser_p - 0.55) / 0.45), alpha_scale=0.28)
+        else:
+            draw_materializing_laser_grid(laser, t, laser_p)
 
-    # Tiny finishing flash, not a death-style whiteout.
-    if p > 0.88:
-        flash = (p - 0.88) / 0.12
-        render_fullscreen_overlay((0.65, 0.95, 1.0), 0.10 * math.sin(flash * math.pi))
+    # Player body assembles throughout the preview, beginning close-up and ending
+    # as a fully coloured, locked cube at the start point.
+    draw_materializing_player(player, t, p)
+
+    # Gentle final field-lock flash. Kept low so it does not erase the preview.
+    if p > 0.86:
+        flash = (p - 0.86) / 0.14
+        render_fullscreen_overlay((0.65, 0.95, 1.0), 0.12 * math.sin(flash * math.pi))
     render_materialization_overlay(t, p)
 
 
@@ -8117,6 +8355,13 @@ def main():
             course_materialize_timer += dt
             if course_materialize_timer >= COURSE_MATERIALIZE_SECONDS:
                 course_materialize_timer = 0.0
+                # The preview/flyover is not playable time. Start every timed
+                # level's first leg clock at the exact frame control is handed
+                # to the player, so LEVEL_PREVIEW_SECONDS can be changed freely
+                # without stealing seconds from TIME_PER_LEG_SECONDS.
+                if current_level >= TIME_MODE_START_LEVEL:
+                    timed_leg_timer = TIME_PER_LEG_SECONDS
+                    timed_current_module = 0
                 game_state = "playing"
                 damage_timer = 0.45
                 set_message(f"LEVEL {current_level}", 0.9)
