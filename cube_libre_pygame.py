@@ -18,7 +18,7 @@
 #
 # this version: june 22, 2026
 
-version_number = "0.15.78-entropy phase"
+version_number = "0.15.79-phase cards hold"
 
 import colorsys
 import importlib.util
@@ -292,10 +292,18 @@ COURSE_ROUTE_3D_SPINE = ((1, 0, 0), (0, 0, 1), (0, 1, 0))
 COURSE_ROUTE_CLEARANCE = 1.0
 COURSE_ROUTE_DEBUG = False
 
+# Phase-unlock info cards. SPACE/TIME/ENTROPY should all use the same readable
+# duration so the player has time to parse the new rule before the maze resumes.
+# Keep the named per-phase aliases below for future overrides, but default them
+# all to this shared value.
+PHASE_INTRO_SECONDS = 5.0
+PHASE_INTRO_FADE_IN_SECONDS = 1.10
+PHASE_INTRO_FADE_OUT_START_RATIO = 0.86
+
 # One-shot spatiality warning. With the default 3D route, level 3 is where the
 # world-Y leg first appears, so announce the extra axis before materialization.
-SPACE_INTRO_SECONDS = 3.20
-SPACE_INTRO_FADE_IN_SECONDS = 1.10
+SPACE_INTRO_SECONDS = PHASE_INTRO_SECONDS
+SPACE_INTRO_FADE_IN_SECONDS = PHASE_INTRO_FADE_IN_SECONDS
 
 # L-turn geometry. A turn is not a huge extra box and it does not hijack
 # controls. It is just a same-cross-section joint cube with two openings, plus
@@ -437,8 +445,8 @@ RECOUPLING_ACTIVE_SPAM_CONSUMES_QUOTA = True
 # that stretch, the collapsing pipe kills you.
 TIME_MODE_START_LEVEL = 5
 TIME_PER_LEG_SECONDS = 30.0
-TIME_INTRO_SECONDS = 3.20
-TIME_INTRO_FADE_IN_SECONDS = 1.10
+TIME_INTRO_SECONDS = PHASE_INTRO_SECONDS
+TIME_INTRO_FADE_IN_SECONDS = PHASE_INTRO_FADE_IN_SECONDS
 TIME_TIMER_WARNING_SECONDS = 8.0
 TIME_BUZZER_START_SECONDS = 10.0
 TIME_SIREN_START_SECONDS = 5.0
@@ -449,8 +457,8 @@ TIME_BUZZER_COOLDOWN_SECONDS = 0.82
 # effective gather rate to 50% and announces the phase once, like SPACE/TIME.
 ENTROPY_MODE_START_LEVEL = 10
 ENTROPY_RECOUPLING_GATHER_RATE = 0.50
-ENTROPY_INTRO_SECONDS = 3.20
-ENTROPY_INTRO_FADE_IN_SECONDS = 1.10
+ENTROPY_INTRO_SECONDS = PHASE_INTRO_SECONDS
+ENTROPY_INTRO_FADE_IN_SECONDS = PHASE_INTRO_FADE_IN_SECONDS
 
 # Audio mix tuning. Keep runtime mixer gain separate from source-file gain.
 # The alien-gamelan WAV is deliberately generated/copied from the safe old synth
@@ -6770,8 +6778,9 @@ def _render_void_intro_card(t: float, timer: float, total_seconds: float, fade_s
     sub.set_alpha(alpha)
     panel = pygame.Surface((900, 240), pygame.SRCALPHA)
     breath = 1.0 + 0.012 * math.sin(t * 2.8)
-    if progress > 0.72:
-        out = smoothstep((progress - 0.72) / 0.28)
+    fade_out_start = clamp(PHASE_INTRO_FADE_OUT_START_RATIO, 0.0, 0.98)
+    if progress > fade_out_start:
+        out = smoothstep((progress - fade_out_start) / max(0.001, 1.0 - fade_out_start))
         label.set_alpha(int(alpha * (1.0 - out)))
         sub.set_alpha(int(alpha * (1.0 - out)))
     if breath != 1.0:
